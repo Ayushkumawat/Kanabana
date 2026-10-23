@@ -5,7 +5,7 @@ import { useAuth } from '../auth';
 export default function Login() {
   const { user, loading, login } = useAuth();
   const [email, setEmail] = useState('admin@aiunika.com');
-  const [password, setPassword] = useState('Admin123!');
+  const [password, setPassword] = useState('1234.4321');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -56,7 +56,7 @@ export default function Login() {
             {error ? <p className="error">{error}</p> : null}
             <button className="btn primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
           </form>
-          <p className="hint">Admin sign-in is admin@aiunika.com. Change that password after you sign in. New people are added from Directory.</p>
+          <p className="hint">Sign in as admin@aiunika.com. New people are added from Directory.</p>
         </div>
       </section>
     </div>

@@ -9,9 +9,6 @@ const samir = 'usr_samir';
 const fullstack = 'dep_fullstack';
 const ai = 'dep_ai';
 const project = 'prj_portal';
-const discovery = 'stg_discovery';
-const build = 'stg_build';
-const launch = 'stg_launch';
 const sketch = 'task_sketch';
 const nav = 'task_nav';
 const shell = 'task_shell';
@@ -33,9 +30,6 @@ export function seed(db) {
   const tue = isoDate(addDays(monday, 1));
   const fri = isoDate(addDays(monday, 4));
   const nextWed = isoDate(addDays(monday, 9));
-  const buildStart = isoDate(addDays(monday, 7));
-  const buildEnd = isoDate(addDays(monday, 18));
-  const launchStart = isoDate(addDays(monday, 21));
   const launchEnd = isoDate(addDays(monday, 25));
   const earlierLaunchEnd = isoDate(addDays(parseISODate(launchEnd), -2));
   const lastWed = isoDate(addDays(monday, -5));
@@ -80,32 +74,8 @@ export function seed(db) {
     const addMember = db.prepare('INSERT INTO project_members (project_id, user_id) VALUES (?, ?)');
     for (const userId of [priya, arun, lena, samir]) addMember.run(project, userId);
 
-    const addStage = db.prepare(`
-      INSERT INTO project_stages (id, project_id, name, start_date, end_date, position)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    addStage.run(discovery, project, 'Discovery', mon, fri, 0);
-    addStage.run(build, project, 'Build', buildStart, buildEnd, 1);
-    addStage.run(launch, project, 'Launch', launchStart, launchEnd, 2);
-
-    const before = {
-      startDate: mon,
-      endDate: earlierLaunchEnd,
-      stages: [
-        { id: discovery, name: 'Discovery', startDate: mon, endDate: fri },
-        { id: build, name: 'Build', startDate: buildStart, endDate: buildEnd },
-        { id: launch, name: 'Launch', startDate: launchStart, endDate: earlierLaunchEnd },
-      ],
-    };
-    const after = {
-      startDate: mon,
-      endDate: launchEnd,
-      stages: [
-        { id: discovery, name: 'Discovery', startDate: mon, endDate: fri },
-        { id: build, name: 'Build', startDate: buildStart, endDate: buildEnd },
-        { id: launch, name: 'Launch', startDate: launchStart, endDate: launchEnd },
-      ],
-    };
+    const before = { startDate: mon, endDate: earlierLaunchEnd };
+    const after = { startDate: mon, endDate: launchEnd };
     db.prepare(`
       INSERT INTO timeline_changes (id, project_id, actor_id, reason, before_json, after_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -126,13 +96,13 @@ export function seed(db) {
         created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)
     `);
-    addTask.run(sketch, 'Sketch the navigation', 'Map the signed-in header, the project list, and the empty state.', project, discovery, priya, priya, 'done', 'medium', tue, 'project', null, stamp, stamp);
-    addTask.run(nav, 'Build the navigation', 'Turn the sketch into the shared header and side navigation.', project, discovery, priya, arun, 'upcoming', 'high', fri, 'project', sketch, stamp, stamp);
-    addTask.run(shell, 'Set up the portal shell', 'Stand up the app shell, routing, and the place the model response will land.', project, discovery, arun, arun, 'in_progress', 'high', fri, 'project', null, stamp, stamp);
-    addTask.run(model, 'Wire the summary model', 'Connect the summary endpoint and show a readable result on the project page.', project, build, arun, samir, 'upcoming', 'high', nextWed, 'project', shell, stamp, stamp);
-    addTask.run(evaluation, 'Draft the evaluation set', 'Collect ten real portal questions and the answer we expect from the model.', project, discovery, lena, lena, 'upcoming', 'medium', isoDate(addDays(monday, 2)), 'project', null, stamp, stamp);
-    addTask.run(review, 'Review the API contracts', 'Check the routes Arun is exposing before Samir binds the model to them.', project, discovery, priya, priya, 'in_progress', 'high', yesterday, 'project', null, stamp, stamp);
-    addTask.run(audit, 'Audit the old portal', 'Note which screens people still use before we replace them.', project, discovery, arun, arun, 'done', 'low', lastWed, 'project', null, earlier, earlier);
+    addTask.run(sketch, 'Sketch the navigation', 'Map the signed-in header, the project list, and the empty state.', project, null, priya, priya, 'done', 'medium', tue, 'project', null, stamp, stamp);
+    addTask.run(nav, 'Build the navigation', 'Turn the sketch into the shared header and side navigation.', project, null, priya, arun, 'upcoming', 'high', fri, 'project', sketch, stamp, stamp);
+    addTask.run(shell, 'Set up the portal shell', 'Stand up the app shell, routing, and the place the model response will land.', project, null, arun, arun, 'in_progress', 'high', fri, 'project', null, stamp, stamp);
+    addTask.run(model, 'Wire the summary model', 'Connect the summary endpoint and show a readable result on the project page.', project, null, arun, samir, 'upcoming', 'high', nextWed, 'project', shell, stamp, stamp);
+    addTask.run(evaluation, 'Draft the evaluation set', 'Collect ten real portal questions and the answer we expect from the model.', project, null, lena, lena, 'upcoming', 'medium', isoDate(addDays(monday, 2)), 'project', null, stamp, stamp);
+    addTask.run(review, 'Review the API contracts', 'Check the routes Arun is exposing before Samir binds the model to them.', project, null, priya, priya, 'in_progress', 'high', yesterday, 'project', null, stamp, stamp);
+    addTask.run(audit, 'Audit the old portal', 'Note which screens people still use before we replace them.', project, null, arun, arun, 'done', 'low', lastWed, 'project', null, earlier, earlier);
     addTask.run(confirm, 'Confirm department leads for the quarter', 'Check Full-stack and AI still have the right leads.', null, null, admin, admin, 'upcoming', 'medium', fri, 'personal', null, stamp, stamp);
 
     db.prepare('UPDATE tasks SET handoff_task_id = ? WHERE id = ?').run(nav, sketch);

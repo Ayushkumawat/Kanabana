@@ -4,6 +4,7 @@ import { api } from '../api';
 import { useAuth, useToast } from '../auth';
 import Kanban from '../components/Kanban';
 import Modal from '../components/Modal';
+import Notepad from '../components/Notepad';
 import TaskDrawer from '../components/TaskDrawer';
 import TaskForm from '../components/TaskForm';
 import TrendChart from '../components/TrendChart';
@@ -268,37 +269,3 @@ export default function Board({ scope, personId = '' }) {
   );
 }
 
-function Notepad() {
-  const toast = useToast();
-  const [body, setBody] = useState('');
-  const [saved, setSaved] = useState('');
-  const [ready, setReady] = useState(false);
-
-  useEffect(() => {
-    api('/notepad').then((data) => {
-      setBody(data.body || '');
-      setSaved(data.body || '');
-      setReady(true);
-    }).catch((err) => toast(err.message, 'bad'));
-  }, [toast]);
-
-  async function save() {
-    try {
-      await api('/notepad', { method: 'PUT', body: { body } });
-      setSaved(body);
-      toast('Notepad saved');
-    } catch (err) {
-      toast(err.message, 'bad');
-    }
-  }
-
-  return (
-    <section className="panel stack notepad">
-      <p className="hint">Only you can see this. It stays on your board.</p>
-      <textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Notes, reminders, draft thoughts…" disabled={!ready} />
-      <div className="form-actions">
-        <button type="button" className="btn primary" disabled={!ready || body === saved} onClick={save}>Save note</button>
-      </div>
-    </section>
-  );
-}

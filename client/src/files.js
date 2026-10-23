@@ -13,6 +13,16 @@ export function readFile(file) {
   });
 }
 
+export async function fileObjectUrl(stored) {
+  const token = getToken();
+  const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!response.ok) throw new Error('Could not open that file');
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
 export async function downloadFile(stored, name) {
   const token = getToken();
   const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, {

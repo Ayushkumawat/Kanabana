@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useToast } from '../auth';
+import Field from '../components/Field';
 import { formatWhen, statusLabel } from '../util';
 
 export default function Requests() {
@@ -10,6 +11,8 @@ export default function Requests() {
   const [requests, setRequests] = useState([]);
   const [departures, setDepartures] = useState([]);
   const [choice, setChoice] = useState({});
+  const [declineId, setDeclineId] = useState('');
+  const [declineNote, setDeclineNote] = useState('');
   const [error, setError] = useState('');
 
   function load() {
@@ -25,12 +28,14 @@ export default function Requests() {
     load();
   }, []);
 
-  async function act(request, action) {
+  async function act(request, action, note = '') {
     try {
       if (action === 'done') await api(`/tasks/${request.taskId}/status`, { method: 'PATCH', body: { status: 'done' } });
       if (action === 'delete') await api(`/tasks/${request.taskId}`, { method: 'DELETE' });
-      if (action === 'decline') await api(`/requests/${request.id}/decline`, { method: 'POST', body: {} });
+      if (action === 'decline') await api(`/requests/${request.id}/decline`, { method: 'POST', body: { note } });
       toast(action === 'decline' ? 'Request declined' : action === 'delete' ? 'Task removed' : 'Marked done');
+      setDeclineId('');
+      setDeclineNote('');
       await load();
     } catch (err) {
       toast(err.message, 'bad');
@@ -122,10 +127,31 @@ export default function Requests() {
             </p>
             {request.note ? <p className="banner wait">{request.note}</p> : null}
             {request.canAnswer ? (
-              <div className="actions">
-                {request.kind === 'review' ? <button type="button" className="btn primary small" onClick={() => act(request, 'done')}>Mark done</button> : null}
-                {request.kind === 'remove' ? <button type="button" className="btn danger small" onClick={() => act(request, 'delete')}>Remove task</button> : null}
-                <button type="button" className="btn ghost small" onClick={() => act(request, 'decline')}>Decline</button>
+              <div className="stack">
+                <div className="actions">
+                  {request.kind === 'review' ? <button type="button" className="btn primary small" onClick={() => act(request, 'done')}>Mark done</button> : null}
+                  {request.kind === 'remove' ? <button type="button" className="btn danger small" onClick={() => act(request, 'delete')}>Remove task</button> : null}
+                  {declineId === request.id ? null : (
+                    <button type="button" className="btn ghost small" onClick={() => { setDeclineId(request.id); setDeclineNote(''); }}>Decline</button>
+                  )}
+                </div>
+                {declineId === request.id ? (
+                  <form
+                    className="stack"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      act(request, 'decline', declineNote);
+                    }}
+                  >
+                    <Field label="Note for them" hint="Optional. They’ll see it with the decline.">
+                      <textarea value={declineNote} onChange={(event) => setDeclineNote(event.target.value)} maxLength={500} placeholder="Why you’re sending this back" />
+                    </Field>
+                    <div className="actions">
+                      <button type="button" className="btn ghost small" onClick={() => setDeclineId('')}>Cancel</button>
+                      <button className="btn small">Decline</button>
+                    </div>
+                  </form>
+                ) : null}
               </div>
             ) : (
               <p className="hint">Waiting on your team lead.</p>

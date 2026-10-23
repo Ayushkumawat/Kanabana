@@ -7,6 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { addDays, isISODate, isoDate, parseISODate, startOfWeek, todayISO, weekdayMon1 } from './dates.js';
 import { db, ensureRecurring, id, logActivity, notify, now } from './db.js';
+import { lanAddresses, publishOfficeName } from './office.js';
 import { registerSections } from './sections.js';
 
 const PORT = process.env.PORT || 4050;
@@ -23,7 +24,11 @@ const STATUS_LABEL = {
 
 const app = express();
 app.disable('x-powered-by');
-app.use(cors());
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  next();
+});
+app.use(cors({ origin: true }));
 app.use(express.json({ limit: '15mb' }));
 
 function bad(res, status, error) {
@@ -223,25 +228,9 @@ function canHandleRequest(auth, row) {
   return Boolean(auth.isLead && creatorId === auth.id);
 }
 
-function stagesFit(startDate, endDate, stages) {
-  for (const stage of stages) {
-    if (!isISODate(stage.startDate) || !isISODate(stage.endDate) || stage.endDate < stage.startDate) {
-      return `Check the dates on “${stage.name || 'a stage'}”`;
-    }
-    if (stage.startDate < startDate || stage.endDate > endDate) {
-      return `“${stage.name}” sits outside the project dates`;
-    }
-  }
-  return '';
-}
-
 function timelineSnapshot(projectId) {
   const project = db.prepare('SELECT start_date, end_date FROM projects WHERE id = ?').get(projectId);
-  const stages = db.prepare(`
-    SELECT id, name, start_date AS startDate, end_date AS endDate
-    FROM project_stages WHERE project_id = ? ORDER BY position
-  `).all(projectId);
-  return { startDate: project.start_date, endDate: project.end_date, stages };
+  return { startDate: project.start_date, endDate: project.end_date };
 }
 
 function presentProject(row, auth, withHistory = false) {
@@ -255,10 +244,6 @@ function presentProject(row, auth, withHistory = false) {
     JOIN project_members pm ON pm.user_id = u.id
     WHERE pm.project_id = ? ORDER BY u.name
   `).all(row.id).map((member) => ({ ...member, active: Boolean(member.active) }));
-  const stages = db.prepare(`
-    SELECT id, name, start_date AS startDate, end_date AS endDate, position
-    FROM project_stages WHERE project_id = ? ORDER BY position
-  `).all(row.id);
   const counts = db.prepare(`
     SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done
     FROM tasks WHERE project_id = ?
@@ -273,7 +258,6 @@ function presentProject(row, auth, withHistory = false) {
     createdAt: row.created_at,
     departments,
     members,
-    stages,
     taskCount: counts.total || 0,
     doneCount: counts.done || 0,
     createdBy: row.created_by,
@@ -304,13 +288,12 @@ function presentProject(row, auth, withHistory = false) {
 
 const TASK_SQL = `
 SELECT
-  t.id, t.title, t.description, t.project_id, t.stage_id, t.creator_id, t.assignee_id,
+  t.id, t.title, t.description, t.project_id, t.creator_id, t.assignee_id,
   t.status, t.priority, t.due_date, t.kind, t.recurring_rule_id, t.parent_task_id,
   t.handoff_task_id, t.created_at, t.updated_at, t.completed_at,
   cu.name AS creator_name,
   au.name AS assignee_name,
   p.name AS project_name,
-  s.name AS stage_name,
   parent.title AS parent_title,
   parent.status AS parent_status,
   pau.name AS parent_assignee_name,
@@ -326,7 +309,6 @@ FROM tasks t
 JOIN users cu ON cu.id = t.creator_id
 JOIN users au ON au.id = t.assignee_id
 LEFT JOIN projects p ON p.id = t.project_id
-LEFT JOIN project_stages s ON s.id = t.stage_id
 LEFT JOIN tasks parent ON parent.id = t.parent_task_id
 LEFT JOIN users pau ON pau.id = parent.assignee_id
 LEFT JOIN tasks child ON child.id = t.handoff_task_id
@@ -346,8 +328,6 @@ function mapTask(row, weekEnd, weekStart = null) {
     description: row.description,
     projectId: row.project_id,
     projectName: row.project_name || null,
-    stageId: row.stage_id,
-    stageName: row.stage_name || null,
     creatorId: row.creator_id,
     creatorName: row.creator_name,
     assigneeId: row.assignee_id,
@@ -443,7 +423,7 @@ function insertTaskRow(fields) {
     fields.title,
     fields.description || '',
     fields.projectId || null,
-    fields.stageId || null,
+    null,
     fields.creatorId,
     fields.assigneeId,
     fields.status,
@@ -483,7 +463,6 @@ function createHandoff(parentId, auth, handoff) {
     title: title.value,
     description: description.value,
     projectId: parent.project_id,
-    stageId: parent.stage_id,
     creatorId: auth.id,
     assigneeId: next.id,
     status: 'upcoming',
@@ -1095,16 +1074,6 @@ app.post('/api/projects', requireAuth, (req, res) => {
       return bad(res, 400, `${member.name} is not in the selected departments`);
     }
   }
-  const incoming = Array.isArray(req.body.stages) ? req.body.stages : [];
-  if (!incoming.length) return bad(res, 400, 'Add at least one stage');
-  const stages = [];
-  for (const stage of incoming) {
-    const stageName = readText(stage.name, 80, 'a stage name', true);
-    if (stageName.error) return bad(res, 400, stageName.error);
-    stages.push({ name: stageName.value, startDate: stage.startDate, endDate: stage.endDate });
-  }
-  const fit = stagesFit(startDate, endDate, stages);
-  if (fit) return bad(res, 400, fit);
   const projectId = id('prj');
   db.transaction(() => {
     db.prepare(`
@@ -1115,11 +1084,6 @@ app.post('/api/projects', requireAuth, (req, res) => {
     for (const departmentId of departmentIds) addDepartment.run(projectId, departmentId);
     const addMember = db.prepare('INSERT INTO project_members (project_id, user_id) VALUES (?, ?)');
     for (const memberId of memberIds) addMember.run(projectId, memberId);
-    const addStage = db.prepare(`
-      INSERT INTO project_stages (id, project_id, name, start_date, end_date, position)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    stages.forEach((stage, index) => addStage.run(id('stg'), projectId, stage.name, stage.startDate, stage.endDate, index));
     logActivity(req.auth.id, `${req.auth.name} created the project “${name.value}”.`, null, projectId);
   })();
   const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
@@ -1183,22 +1147,9 @@ app.patch('/api/projects/:id/timeline', requireAuth, (req, res) => {
   if (!isISODate(startDate) || !isISODate(endDate) || endDate < startDate) {
     return bad(res, 400, 'Check the project start and end dates');
   }
-  const existing = db.prepare('SELECT id, name FROM project_stages WHERE project_id = ? ORDER BY position').all(row.id);
-  const incoming = Array.isArray(req.body.stages) ? req.body.stages : [];
-  if (incoming.length !== existing.length || existing.some((stage) => !incoming.some((item) => item.id === stage.id))) {
-    return bad(res, 400, 'Include every stage when you change the timeline');
-  }
-  const stages = existing.map((stage) => {
-    const item = incoming.find((entry) => entry.id === stage.id);
-    return { id: stage.id, name: stage.name, startDate: item.startDate, endDate: item.endDate };
-  });
-  const fit = stagesFit(startDate, endDate, stages);
-  if (fit) return bad(res, 400, fit);
   const before = timelineSnapshot(row.id);
   db.transaction(() => {
     db.prepare('UPDATE projects SET start_date = ?, end_date = ? WHERE id = ?').run(startDate, endDate, row.id);
-    const updateStage = db.prepare('UPDATE project_stages SET start_date = ?, end_date = ? WHERE id = ? AND project_id = ?');
-    for (const stage of stages) updateStage.run(stage.startDate, stage.endDate, stage.id, row.id);
     const after = timelineSnapshot(row.id);
     db.prepare(`
       INSERT INTO timeline_changes (id, project_id, actor_id, reason, before_json, after_json, created_at)
@@ -1240,50 +1191,6 @@ app.delete('/api/projects/:id/members/:userId', requireAuth, (req, res) => {
   db.prepare('DELETE FROM project_members WHERE project_id = ? AND user_id = ?').run(row.id, req.params.userId);
   logActivity(req.auth.id, `${req.auth.name} removed a person from ${row.name}.`, null, row.id);
   res.json({ project: presentProject(db.prepare('SELECT * FROM projects WHERE id = ?').get(row.id), req.auth, true) });
-});
-
-app.post('/api/projects/:id/stages', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  if (!row) return bad(res, 404, 'Project not found');
-  if (!managesProject(req.auth, row)) return bad(res, 403, 'Only an admin or the person who created this project can add a stage');
-  const name = readText(req.body.name, 80, 'a stage name', true);
-  if (name.error) return bad(res, 400, name.error);
-  const stage = { name: name.value, startDate: req.body.startDate, endDate: req.body.endDate };
-  const fit = stagesFit(row.start_date, row.end_date, [stage]);
-  if (fit) return bad(res, 400, fit);
-  const position = db.prepare('SELECT COALESCE(MAX(position), -1) AS max FROM project_stages WHERE project_id = ?').get(row.id).max + 1;
-  db.prepare(`
-    INSERT INTO project_stages (id, project_id, name, start_date, end_date, position)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(id('stg'), row.id, stage.name, stage.startDate, stage.endDate, position);
-  logActivity(req.auth.id, `${req.auth.name} added the stage “${stage.name}” to ${row.name}.`, null, row.id);
-  res.status(201).json({ project: presentProject(db.prepare('SELECT * FROM projects WHERE id = ?').get(row.id), req.auth, true) });
-});
-
-app.patch('/api/projects/:id/stages/:stageId', requireAuth, (req, res) => {
-  const stage = db.prepare('SELECT * FROM project_stages WHERE id = ? AND project_id = ?').get(req.params.stageId, req.params.id);
-  if (!stage) return bad(res, 404, 'Stage not found');
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  if (!managesProject(req.auth, project)) return bad(res, 403, 'Only an admin or the person who created this project can change a stage');
-  const name = readText(req.body.name, 80, 'a stage name', true);
-  if (name.error) return bad(res, 400, name.error);
-  const next = { name: name.value, startDate: req.body.startDate, endDate: req.body.endDate };
-  const fit = stagesFit(project.start_date, project.end_date, [next]);
-  if (fit) return bad(res, 400, fit);
-  db.prepare('UPDATE project_stages SET name = ?, start_date = ?, end_date = ? WHERE id = ?').run(next.name, next.startDate, next.endDate, stage.id);
-  res.json({ project: presentProject(project, req.auth, true) });
-});
-
-app.delete('/api/projects/:id/stages/:stageId', requireAuth, (req, res) => {
-  const stage = db.prepare('SELECT * FROM project_stages WHERE id = ? AND project_id = ?').get(req.params.stageId, req.params.id);
-  if (!stage) return bad(res, 404, 'Stage not found');
-  const projectRow = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  if (!managesProject(req.auth, projectRow)) return bad(res, 403, 'Only an admin or the person who created this project can delete a stage');
-  const used = db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE stage_id = ?').get(stage.id).n;
-  if (used) return bad(res, 400, 'Move the tasks off this stage before deleting it');
-  db.prepare('DELETE FROM project_stages WHERE id = ?').run(stage.id);
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
-  res.json({ project: presentProject(project, req.auth, true) });
 });
 
 app.get('/api/tasks', requireAuth, (req, res) => {
@@ -1339,10 +1246,11 @@ app.get('/api/tasks', requireAuth, (req, res) => {
     }
     where.push(`(
       (t.due_date >= ? AND t.due_date <= ?)
+      OR (t.status = 'done' AND substr(t.completed_at, 1, 10) >= ? AND substr(t.completed_at, 1, 10) <= ?)
       OR (? = 1 AND t.due_date > ? AND t.status != 'done' AND t.parent_task_id IS NOT NULL)
       OR (? = 1 AND t.due_date >= ? AND t.due_date < ? AND t.status != 'done')
     )`);
-    params.push(weekStart, weekEnd, isCurrent ? 1 : 0, weekEnd, includePrevious ? 1 : 0, prevStart, weekStart);
+    params.push(weekStart, weekEnd, weekStart, weekEnd, isCurrent ? 1 : 0, weekEnd, includePrevious ? 1 : 0, prevStart, weekStart);
   }
 
   let rows = db.prepare(`
@@ -1355,7 +1263,7 @@ app.get('/api/tasks', requireAuth, (req, res) => {
     if (!hasTodo) {
       const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
       const scopeWhere = where.slice(0, -1);
-      const scopeParams = params.slice(0, -7);
+      const scopeParams = params.slice(0, -9);
       const extra = db.prepare(`
         ${TASK_SQL}
         WHERE ${scopeWhere.join(' AND ')}
@@ -1384,7 +1292,6 @@ app.post('/api/tasks', requireAuth, (req, res) => {
   if (!isISODate(req.body.dueDate)) return bad(res, 400, 'Choose a due date');
   const priority = PRIORITIES.has(req.body.priority) ? req.body.priority : 'medium';
   const projectId = req.body.projectId || null;
-  let stageId = req.body.stageId || null;
   let assigneeId = req.body.assigneeId || req.auth.id;
   const project = projectId ? db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) : null;
   const assigningSomeoneElse = assigneeId !== req.auth.id;
@@ -1400,11 +1307,6 @@ app.post('/api/tasks', requireAuth, (req, res) => {
     const onProject = isProjectMember(projectId, req.auth.id) || canAssignOnProject(req.auth, project);
     if (!onProject) return bad(res, 403, 'Only people on the project can add their part');
     if (!isProjectMember(projectId, assigneeId)) return bad(res, 400, 'Add them to the project before assigning this task');
-    if (stageId && !db.prepare('SELECT 1 FROM project_stages WHERE id = ? AND project_id = ?').get(stageId, projectId)) {
-      return bad(res, 400, 'That stage is not on this project');
-    }
-  } else {
-    stageId = null;
   }
   try {
     const taskId = db.transaction(() => {
@@ -1412,7 +1314,6 @@ app.post('/api/tasks', requireAuth, (req, res) => {
         title: title.value,
         description: description.value,
         projectId,
-        stageId,
         creatorId: req.auth.id,
         assigneeId,
         status: 'upcoming',
@@ -1536,7 +1437,6 @@ app.post('/api/tasks/:id/followup', requireAuth, (req, res) => {
         title: title.value,
         description: description.value,
         projectId: task.project_id,
-        stageId: task.stage_id,
         creatorId: req.auth.id,
         assigneeId: assignee.id,
         status: 'upcoming',
@@ -1616,14 +1516,8 @@ app.patch('/api/tasks/:id', requireAuth, (req, res) => {
   if (!STATUSES.has(req.body.status)) return bad(res, 400, 'Choose a status');
   const assignee = activeUser(req.body.assigneeId);
   if (!assignee) return bad(res, 400, 'Choose an active person');
-  let stageId = req.body.stageId || null;
-  if (task.project_id) {
-    if (!isProjectMember(task.project_id, assignee.id)) return bad(res, 400, 'The assignee needs to be on this project');
-    if (stageId && !db.prepare('SELECT 1 FROM project_stages WHERE id = ? AND project_id = ?').get(stageId, task.project_id)) {
-      return bad(res, 400, 'That stage is not on this project');
-    }
-  } else {
-    stageId = null;
+  if (task.project_id && !isProjectMember(task.project_id, assignee.id)) {
+    return bad(res, 400, 'The assignee needs to be on this project');
   }
   if (req.body.status === 'done' && task.status !== 'done') {
     const waiting = openDependencyBlock(task.id);
@@ -1632,9 +1526,9 @@ app.patch('/api/tasks/:id', requireAuth, (req, res) => {
   const completedAt = req.body.status === 'done' ? (task.status === 'done' && task.completed_at ? task.completed_at : now()) : null;
   db.prepare(`
     UPDATE tasks
-    SET title = ?, description = ?, assignee_id = ?, due_date = ?, priority = ?, stage_id = ?, status = ?, completed_at = ?, updated_at = ?
+    SET title = ?, description = ?, assignee_id = ?, due_date = ?, priority = ?, stage_id = NULL, status = ?, completed_at = ?, updated_at = ?
     WHERE id = ?
-  `).run(title.value, description.value, assignee.id, req.body.dueDate, req.body.priority, stageId, req.body.status, completedAt, now(), task.id);
+  `).run(title.value, description.value, assignee.id, req.body.dueDate, req.body.priority, req.body.status, completedAt, now(), task.id);
   if (assignee.id !== task.assignee_id) {
     notify(assignee.id, `${req.auth.name} assigned “${title.value}” to you.`, task.id, task.project_id);
   }
@@ -1711,9 +1605,15 @@ app.post('/api/requests/:id/decline', requireAuth, (req, res) => {
   `).get(req.params.id);
   if (!row || row.status !== 'open') return bad(res, 404, 'Request not found');
   if (!canHandleRequest(req.auth, row)) return bad(res, 403, 'Only the team lead can answer this');
-  db.prepare(`UPDATE task_requests SET status = 'declined' WHERE id = ?`).run(row.id);
+  const note = readText(req.body.note, 500, 'a note');
+  if (note.error) return bad(res, 400, note.error);
+  db.prepare(`UPDATE task_requests SET status = 'declined', response_note = ? WHERE id = ?`).run(note.value, row.id);
   const label = row.kind === 'remove' ? 'remove' : 'review';
-  notify(row.requester_id, `${req.auth.name} declined the request to ${label} “${row.title}”.`, row.task_id, row.project_id, 'requests');
+  const message = note.value
+    ? `${req.auth.name} declined the request to ${label} “${row.title}”. Note: ${note.value}`
+    : `${req.auth.name} declined the request to ${label} “${row.title}”.`;
+  notify(row.requester_id, message, row.task_id, row.project_id, 'requests');
+  logActivity(req.auth.id, message, row.task_id, row.project_id);
   res.json({ ok: true });
 });
 
@@ -2139,8 +2039,14 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: 'Something went wrong' });
 });
 
-app.listen(PORT, () => {
+const officeAddresses = lanAddresses();
+if (officeAddresses[0]) publishOfficeName(officeAddresses[0]);
+
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Kanabana API listening on ${PORT}`);
+  if (!officeAddresses.length) return;
+  console.log(`On this Wi-Fi, open http://kanabana.local:5173`);
+  console.log(`Office API is http://${officeAddresses[0]}:${PORT}`);
 });
 
 

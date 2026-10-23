@@ -8,7 +8,6 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
   const { user } = useAuth();
   const choices = projects.filter((project) => project.canAddTask && project.status !== 'done');
   const [projectId, setProjectId] = useState(fixedProjectId);
-  const [stageId, setStageId] = useState('');
   const [assigneeId, setAssigneeId] = useState(defaultAssigneeId || user.id);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -29,7 +28,6 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
 
   function chooseProject(value) {
     setProjectId(value);
-    setStageId('');
     const nextProject = choices.find((item) => item.id === value) || projects.find((item) => item.id === value);
     const pool = nextProject ? nextProject.members.filter((member) => member.active !== false) : people;
     const mayAssign = user.isAdmin || (user.isLead && (!value || nextProject?.canAssign));
@@ -52,7 +50,6 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
         dueDate,
         priority,
         projectId: projectId || null,
-        stageId: stageId || null,
         assigneeId: chosen,
       };
       await api('/tasks', { method: 'POST', body });
@@ -90,14 +87,6 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
           </select>
         </Field>
       )}
-      {project ? (
-        <Field label="Stage">
-          <select value={stageId} onChange={(event) => setStageId(event.target.value)}>
-            <option value="">No stage</option>
-            {project.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}
-          </select>
-        </Field>
-      ) : null}
       {canAssign ? (
         <Field label="Assign to" hint={adding ? 'They will be added to the project, then this task goes to their To do.' : (projectId ? 'People already on the project are listed first.' : 'This shows up in their To do, with no project attached.')}>
           <select value={assigneeId} onChange={(event) => setAssigneeId(event.target.value)}>

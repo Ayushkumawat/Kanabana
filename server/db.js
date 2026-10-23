@@ -305,6 +305,11 @@ for (const [table, column] of [['comments', 'author_name'], ['timeline_changes',
   if (!columns.some((item) => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
 }
 
+const requestColumns = db.prepare('PRAGMA table_info(task_requests)').all();
+if (requestColumns.length && !requestColumns.some((column) => column.name === 'response_note')) {
+  db.exec(`ALTER TABLE task_requests ADD COLUMN response_note TEXT NOT NULL DEFAULT ''`);
+}
+
 const userColumns = db.prepare('PRAGMA table_info(users)').all();
 if (!userColumns.some((column) => column.name === 'birthday')) db.exec('ALTER TABLE users ADD COLUMN birthday TEXT');
 if (!userColumns.some((column) => column.name === 'work_anniversary')) db.exec('ALTER TABLE users ADD COLUMN work_anniversary TEXT');
@@ -399,10 +404,49 @@ CREATE TABLE IF NOT EXISTS personal_notes (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notepad_days (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  UNIQUE(user_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notepad_user ON notepad_days(user_id, position);
+
+CREATE TABLE IF NOT EXISTS reports (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  details TEXT NOT NULL,
+  page TEXT,
+  author_id TEXT NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL DEFAULT 'open',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS report_shots (
+  id TEXT PRIMARY KEY,
+  report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+  file_name TEXT NOT NULL,
+  file_stored TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+
 CREATE INDEX IF NOT EXISTS idx_knowledge_kind ON knowledge_items(kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_dependencies_task ON task_dependencies(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_resumes_position ON hiring_resumes(position_id, status);
 `);
+
+const reportColumns = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'reports'").get()
+  ? db.prepare('PRAGMA table_info(reports)').all()
+  : [];
+if (reportColumns.length && !reportColumns.some((column) => column.name === 'page')) {
+  db.exec('ALTER TABLE reports ADD COLUMN page TEXT');
+}
 
 const bootMonday = startOfWeek(new Date());
 ensureRecurring(isoDate(bootMonday), isoDate(addDays(bootMonday, 13)));

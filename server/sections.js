@@ -8,6 +8,33 @@ const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data'
 const ALLOWED = new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt', 'md', 'zip']);
 const ONBOARDING = ['Adding to Razorpay', 'Gate access', 'Document verification', 'System access'];
 
+const IMAGES = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
+
+function saveImage(file) {
+  if (!file?.name || !file?.data) return null;
+  const ext = String(file.name).split('.').pop().toLowerCase();
+  if (!IMAGES.has(ext)) {
+    const error = new Error('Use a png, jpg, webp, or gif screenshot');
+    error.status = 400;
+    throw error;
+  }
+  const raw = Buffer.from(String(file.data), 'base64');
+  if (!raw.length) {
+    const error = new Error('That screenshot was empty');
+    error.status = 400;
+    throw error;
+  }
+  if (raw.length > 3 * 1024 * 1024) {
+    const error = new Error('Keep each screenshot under 3 MB');
+    error.status = 400;
+    throw error;
+  }
+  fs.mkdirSync(uploadDir, { recursive: true });
+  const stored = `${id('file')}.${ext}`;
+  fs.writeFileSync(path.join(uploadDir, stored), raw);
+  return { stored, name: String(file.name).slice(0, 180) };
+}
+
 function saveFile(file) {
   if (!file?.name || !file?.data) return null;
   const ext = String(file.name).split('.').pop().toLowerCase();
@@ -43,19 +70,73 @@ export function registerSections(app, ctx) {
     rawTask, maybeFinishDeparture, isISODate, uniqueList,
   } = ctx;
 
+  function notepadList(userId) {
+    const count = db.prepare('SELECT COUNT(*) AS n FROM notepad_days WHERE user_id = ?').get(userId).n;
+    if (!count) {
+      const legacy = db.prepare('SELECT body, updated_at FROM personal_notes WHERE user_id = ?').get(userId);
+      if (legacy?.body?.trim()) {
+        const day = String(legacy.updated_at || now()).slice(0, 10);
+        db.prepare(`
+          INSERT INTO notepad_days (id, user_id, day, body, position, updated_at)
+          VALUES (?, ?, ?, ?, 0, ?)
+        `).run(id('note'), userId, day, legacy.body, legacy.updated_at || now());
+      }
+    }
+    return db.prepare(`
+      SELECT id, day, body, position, updated_at AS updatedAt
+      FROM notepad_days
+      WHERE user_id = ?
+      ORDER BY position, day DESC
+    `).all(userId);
+  }
+
   app.get('/api/notepad', requireAuth, (req, res) => {
-    const row = db.prepare('SELECT body, updated_at AS updatedAt FROM personal_notes WHERE user_id = ?').get(req.auth.id);
-    res.json({ body: row?.body || '', updatedAt: row?.updatedAt || null });
+    res.json({ notes: notepadList(req.auth.id) });
   });
 
-  app.put('/api/notepad', requireAuth, (req, res) => {
-    const body = readText(req.body.body, 8000, 'the note');
+  app.post('/api/notepad', requireAuth, (req, res) => {
+    if (!isISODate(req.body.day)) return bad(res, 400, 'Choose a day');
+    notepadList(req.auth.id);
+    const existing = db.prepare('SELECT id FROM notepad_days WHERE user_id = ? AND day = ?').get(req.auth.id, req.body.day);
+    if (!existing) {
+      const min = db.prepare('SELECT MIN(position) AS min FROM notepad_days WHERE user_id = ?').get(req.auth.id).min;
+      db.prepare(`
+        INSERT INTO notepad_days (id, user_id, day, body, position, updated_at)
+        VALUES (?, ?, ?, '', ?, ?)
+      `).run(id('note'), req.auth.id, req.body.day, min == null ? 0 : min - 1, now());
+    }
+    res.status(existing ? 200 : 201).json({ notes: notepadList(req.auth.id) });
+  });
+
+  app.post('/api/notepad/order', requireAuth, (req, res) => {
+    const notes = notepadList(req.auth.id);
+    const known = new Set(notes.map((note) => note.id));
+    const wanted = (Array.isArray(req.body.ids) ? req.body.ids : []).filter((noteId) => known.has(noteId));
+    if (!wanted.length) return bad(res, 400, 'Choose notes to rearrange');
+    const queue = [...wanted];
+    const next = notes.map((note) => (wanted.includes(note.id) ? queue.shift() : note.id));
+    const update = db.prepare('UPDATE notepad_days SET position = ? WHERE id = ? AND user_id = ?');
+    db.transaction(() => {
+      next.forEach((noteId, index) => update.run(index, noteId, req.auth.id));
+    })();
+    res.json({ notes: notepadList(req.auth.id) });
+  });
+
+  app.patch('/api/notepad/:id', requireAuth, (req, res) => {
+    const note = db.prepare('SELECT id FROM notepad_days WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.id);
+    if (!note) return bad(res, 404, 'Note not found');
+    const body = readText(req.body.body, 4000, 'the note');
     if (body.error) return bad(res, 400, body.error);
-    db.prepare(`
-      INSERT INTO personal_notes (user_id, body, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at
-    `).run(req.auth.id, body.value, now());
-    res.json({ ok: true, updatedAt: now() });
+    const stamp = now();
+    db.prepare('UPDATE notepad_days SET body = ?, updated_at = ? WHERE id = ?').run(body.value, stamp, note.id);
+    res.json({ id: note.id, body: body.value, updatedAt: stamp });
+  });
+
+  app.delete('/api/notepad/:id', requireAuth, (req, res) => {
+    const note = db.prepare('SELECT id FROM notepad_days WHERE id = ? AND user_id = ?').get(req.params.id, req.auth.id);
+    if (!note) return bad(res, 404, 'Note not found');
+    db.prepare('DELETE FROM notepad_days WHERE id = ?').run(note.id);
+    res.json({ notes: notepadList(req.auth.id) });
   });
 
   app.get('/api/files/:stored', requireAuth, (req, res) => {
@@ -495,5 +576,72 @@ export function registerSections(app, ctx) {
     if (!row) return bad(res, 404, 'Checklist item not found');
     db.prepare('UPDATE hiring_checks SET done = ? WHERE id = ?').run(req.body.done ? 1 : 0, row.id);
     res.json({ ok: true });
+  });
+
+  function reportList() {
+    const rows = db.prepare(`
+      SELECT r.id, r.kind, r.title, r.details, r.page, r.status,
+             r.created_at AS createdAt, r.author_id AS authorId, u.name AS authorName
+      FROM reports r
+      JOIN users u ON u.id = r.author_id
+      ORDER BY r.created_at DESC
+      LIMIT 200
+    `).all();
+    const shots = db.prepare(`
+      SELECT id, report_id AS reportId, file_name AS name, file_stored AS stored
+      FROM report_shots
+    `).all();
+    const byReport = new Map();
+    for (const shot of shots) {
+      if (!byReport.has(shot.reportId)) byReport.set(shot.reportId, []);
+      byReport.get(shot.reportId).push({ id: shot.id, name: shot.name, stored: shot.stored });
+    }
+    return rows.map((row) => ({ ...row, shots: byReport.get(row.id) || [] }));
+  }
+
+  app.get('/api/reports', requireAuth, (req, res) => {
+    res.json({ reports: reportList() });
+  });
+
+  app.post('/api/reports', requireAuth, (req, res) => {
+    const kind = req.body.kind === 'suggestion' ? 'suggestion' : req.body.kind === 'bug' ? 'bug' : '';
+    if (!kind) return bad(res, 400, 'Choose a bug or a suggestion');
+    const title = readText(req.body.title, 140, 'a title', true);
+    if (title.error) return bad(res, 400, title.error);
+    const details = readText(req.body.details, 4000, 'the details', true);
+    if (details.error) return bad(res, 400, details.error);
+    const page = readText(req.body.page, 200, 'the page');
+    if (page.error) return bad(res, 400, page.error);
+    const incoming = Array.isArray(req.body.shots) ? req.body.shots.filter((file) => file?.name || file?.data) : [];
+    if (incoming.length > 3) return bad(res, 400, 'Attach up to 3 screenshots');
+    let saved = [];
+    try {
+      saved = incoming.map((file) => saveImage(file)).filter(Boolean);
+    } catch (error) {
+      return bad(res, error.status || 400, error.message);
+    }
+    const reportId = id('rpt');
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO reports (id, kind, title, details, page, author_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+      `).run(reportId, kind, title.value, details.value, page.value || null, req.auth.id, now());
+      const insert = db.prepare('INSERT INTO report_shots (id, report_id, file_name, file_stored) VALUES (?, ?, ?, ?)');
+      for (const file of saved) insert.run(id('shot'), reportId, file.name, file.stored);
+      logActivity(req.auth.id, `${req.auth.name} reported a ${kind === 'bug' ? 'bug' : 'suggestion'}: ${title.value}.`);
+    })();
+    res.status(201).json({ reports: reportList() });
+  });
+
+  app.patch('/api/reports/:id', requireAuth, (req, res) => {
+    const row = db.prepare('SELECT * FROM reports WHERE id = ?').get(req.params.id);
+    if (!row) return bad(res, 404, 'Report not found');
+    const status = req.body.status === 'fixed' ? 'fixed' : req.body.status === 'open' ? 'open' : '';
+    if (!status) return bad(res, 400, 'Choose open or fixed');
+    if (row.author_id !== req.auth.id && !req.auth.isAdmin && !req.auth.isLead) {
+      return bad(res, 403, 'Only the author or a lead can update this');
+    }
+    db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, row.id);
+    res.json({ reports: reportList() });
   });
 }

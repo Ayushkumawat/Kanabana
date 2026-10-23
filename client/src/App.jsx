@@ -1,7 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { useAuth } from './auth';
 import Layout from './components/Layout';
-import Activity from './pages/Activity';
 import Attendance from './pages/Attendance';
 import Board from './pages/Board';
 import Chores from './pages/Chores';
@@ -14,6 +13,7 @@ import People from './pages/People';
 import ProjectDetail from './pages/ProjectDetail';
 import Projects from './pages/Projects';
 import Recurring from './pages/Recurring';
+import Reports from './pages/Reports';
 import Requests from './pages/Requests';
 import Tenders from './pages/Tenders';
 
@@ -43,7 +43,8 @@ export default function App() {
         <Route path="/projects/:id" element={<ProjectDetail />} />
         <Route path="/repeating" element={<Recurring />} />
         <Route path="/directory" element={<Directory />} />
-        <Route path="/activity" element={<Activity />} />
+        <Route path="/reports" element={<Reports />} />
+        <Route path="/activity" element={<Navigate to="/reports" replace />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

@@ -35,7 +35,7 @@ const GROUPS = [
       { to: '/people', label: 'People', area: 'people', gate: 'lead' },
       { to: '/attendance', label: 'Attendance', area: 'attendance' },
       { to: '/directory', label: 'Directory', area: 'directory' },
-      { to: '/activity', label: 'Activity', area: 'activity' },
+      { to: '/reports', label: 'Bugs & ideas', area: 'reports' },
     ],
   },
 ];

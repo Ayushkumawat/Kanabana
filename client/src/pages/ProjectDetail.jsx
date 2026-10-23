@@ -8,25 +8,6 @@ import TaskDrawer from '../components/TaskDrawer';
 import TaskForm from '../components/TaskForm';
 import { formatDay, formatWhen, parseISODate, statusLabel, todayISO } from '../util';
 
-const STAGE_ROW = 32;
-const STAGE_GAP = 8;
-const STAGE_PAD = 10;
-
-function stageRows(stages) {
-  const rows = [];
-  return stages.map((stage) => {
-    const start = parseISODate(stage.startDate).getTime();
-    const end = parseISODate(stage.endDate).getTime();
-    let row = rows.findIndex((taken) => taken.every((item) => end < item.start || start > item.end));
-    if (row < 0) {
-      row = rows.length;
-      rows.push([]);
-    }
-    rows[row].push({ start, end });
-    return row;
-  });
-}
-
 export default function ProjectDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -42,7 +23,6 @@ export default function ProjectDetail() {
   const [meta, setMeta] = useState(null);
   const [timeline, setTimeline] = useState(null);
   const [memberId, setMemberId] = useState('');
-  const [stage, setStage] = useState({ name: '', startDate: '', endDate: '' });
   const [formError, setFormError] = useState('');
 
   function load() {
@@ -73,18 +53,12 @@ export default function ProjectDetail() {
   const span = Math.max(end - start, 1);
   const today = parseISODate(todayISO()).getTime();
   const showToday = today >= start && today <= end;
-  const rows = stageRows(project.stages);
-  const rowCount = Math.max(...rows, 0) + 1;
-  const timelineHeight = STAGE_PAD * 2 + rowCount * STAGE_ROW + (rowCount - 1) * STAGE_GAP;
   const departmentIds = new Set(project.departments.map((item) => item.id));
   const memberOptions = people.filter((person) => (
     !project.members.some((member) => member.id === person.id)
     && person.departments.some((item) => departmentIds.has(item.id))
   ));
-  const groups = [
-    ...project.stages.map((item) => ({ stage: item, tasks: tasks.filter((task) => task.stageId === item.id) })),
-    { stage: { id: 'none', name: 'No stage' }, tasks: tasks.filter((task) => !task.stageId) },
-  ].filter((group) => group.stage.id !== 'none' || group.tasks.length);
+  const work = [...tasks].sort((a, b) => a.dueDate.localeCompare(b.dueDate) || a.title.localeCompare(b.title));
 
   async function saveTimeline(event) {
     event.preventDefault();
@@ -96,7 +70,6 @@ export default function ProjectDetail() {
           startDate: timeline.startDate,
           endDate: timeline.endDate,
           reason: timeline.reason,
-          stages: timeline.stages.map((item) => ({ id: item.id, startDate: item.startDate, endDate: item.endDate })),
         },
       });
       setProject(data.project);
@@ -125,7 +98,6 @@ export default function ProjectDetail() {
                 startDate: project.startDate,
                 endDate: project.endDate,
                 reason: '',
-                stages: project.stages.map((item) => ({ ...item })),
               })}
             >
               Adjust timeline
@@ -154,21 +126,7 @@ export default function ProjectDetail() {
         </div>
       </div>
       <span className={`pill ${project.status}`}>{project.status}</span>
-      <div className="timeline" style={{ height: timelineHeight }} aria-hidden="true">
-        {project.stages.map((item, index) => {
-          const left = ((parseISODate(item.startDate).getTime() - start) / span) * 100;
-          const width = ((parseISODate(item.endDate).getTime() - parseISODate(item.startDate).getTime()) / span) * 100;
-          return (
-            <div
-              key={item.id}
-              className="stage-bar"
-              style={{ left: `${left}%`, width: `${Math.max(width, 4)}%`, top: STAGE_PAD + rows[index] * (STAGE_ROW + STAGE_GAP) }}
-              title={item.name}
-            >
-              {item.name}
-            </div>
-          );
-        })}
+      <div className="timeline" aria-hidden="true">
         {showToday ? <div className="today-mark" style={{ left: `${((today - start) / span) * 100}%` }} /> : null}
       </div>
       <p className="muted">{formatDay(project.startDate)} – {formatDay(project.endDate)}</p>
@@ -182,27 +140,22 @@ export default function ProjectDetail() {
       <div className="split">
         <section className="panel stack">
           <h2>Work</h2>
-          {groups.map((group) => (
-            <div key={group.stage.id} className="stack">
-              <h3>{group.stage.name}{group.stage.startDate ? ` · ${formatDay(group.stage.startDate)} – ${formatDay(group.stage.endDate)}` : ''}</h3>
-              {group.tasks.length === 0 ? <p className="muted">Nothing in this stage yet.</p> : group.tasks.map((task) => (
-                project.canAssign || task.assigneeId === user.id || task.creatorId === user.id || user.isAdmin ? (
-                  <button type="button" key={task.id} className="handoff-row" onClick={() => setOpenId(task.id)}>
-                    <span>
-                      <strong>{task.assigneeName}</strong> · {task.title}
-                      <small>{formatDay(task.dueDate)} · {statusLabel(task.status)}</small>
-                    </span>
-                  </button>
-                ) : (
-                  <div key={task.id} className="handoff-row">
-                    <span>
-                      <strong>{task.assigneeName}</strong> · {task.title}
-                      <small>{formatDay(task.dueDate)} · {statusLabel(task.status)}</small>
-                    </span>
-                  </div>
-                )
-              ))}
-            </div>
+          {work.length === 0 ? <p className="muted">No tasks on this project yet.</p> : work.map((task) => (
+            project.canAssign || task.assigneeId === user.id || task.creatorId === user.id || user.isAdmin ? (
+              <button type="button" key={task.id} className="handoff-row" onClick={() => setOpenId(task.id)}>
+                <span>
+                  <strong>{task.assigneeName}</strong> · {task.title}
+                  <small>{formatDay(task.dueDate)} · {statusLabel(task.status)}</small>
+                </span>
+              </button>
+            ) : (
+              <div key={task.id} className="handoff-row">
+                <span>
+                  <strong>{task.assigneeName}</strong> · {task.title}
+                  <small>{formatDay(task.dueDate)} · {statusLabel(task.status)}</small>
+                </span>
+              </div>
+            )
           ))}
         </section>
         <div className="stack">
@@ -253,31 +206,6 @@ export default function ProjectDetail() {
               </form>
             ) : null}
           </section>
-          {project.canManage ? (
-            <section className="panel stack">
-              <h2>Add a stage</h2>
-              <form
-                className="stack"
-                onSubmit={async (event) => {
-                  event.preventDefault();
-                  try {
-                    const data = await api(`/projects/${project.id}/stages`, { method: 'POST', body: stage });
-                    setProject(data.project);
-                    setStage({ name: '', startDate: project.startDate, endDate: project.endDate });
-                  } catch (err) {
-                    toast(err.message, 'bad');
-                  }
-                }}
-              >
-                <Field label="Name"><input value={stage.name} onChange={(event) => setStage({ ...stage, name: event.target.value })} required /></Field>
-                <div className="fields two">
-                  <Field label="Starts"><input type="date" value={stage.startDate} onChange={(event) => setStage({ ...stage, startDate: event.target.value })} required /></Field>
-                  <Field label="Ends"><input type="date" value={stage.endDate} onChange={(event) => setStage({ ...stage, endDate: event.target.value })} required /></Field>
-                </div>
-                <button className="btn small">Add stage</button>
-              </form>
-            </section>
-          ) : null}
           <section className="panel stack">
             <h2>Why dates moved</h2>
             {project.history.length === 0 ? <p className="muted">No date changes yet.</p> : (
@@ -349,21 +277,6 @@ export default function ProjectDetail() {
               <Field label="Project starts"><input type="date" value={timeline.startDate} onChange={(event) => setTimeline({ ...timeline, startDate: event.target.value })} required /></Field>
               <Field label="Project ends"><input type="date" value={timeline.endDate} onChange={(event) => setTimeline({ ...timeline, endDate: event.target.value })} required /></Field>
             </div>
-            {timeline.stages.map((item, index) => (
-              <div key={item.id} className="fields three">
-                <strong>{item.name}</strong>
-                <input type="date" value={item.startDate} onChange={(event) => {
-                  const stages = timeline.stages.slice();
-                  stages[index] = { ...item, startDate: event.target.value };
-                  setTimeline({ ...timeline, stages });
-                }} required />
-                <input type="date" value={item.endDate} onChange={(event) => {
-                  const stages = timeline.stages.slice();
-                  stages[index] = { ...item, endDate: event.target.value };
-                  setTimeline({ ...timeline, stages });
-                }} required />
-              </div>
-            ))}
             <Field
               label="Reason"
               hint={user.isAdmin ? 'Optional for an admin. It still stays on the project.' : 'Required. This stays on the project so the other team can see why the dates moved.'}

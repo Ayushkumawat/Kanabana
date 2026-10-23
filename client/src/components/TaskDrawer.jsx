@@ -48,7 +48,6 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
           assigneeId: payload.task.assigneeId,
           dueDate: payload.task.dueDate,
           priority: payload.task.priority,
-          stageId: payload.task.stageId || '',
           status: payload.task.status,
         });
         setReassignId(payload.task.assigneeId);
@@ -103,7 +102,7 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
         {task ? (
           <div className="stack">
             <div className="row-between">
-              <p className="kicker">{task.projectName || 'Personal'}{task.stageName ? ` · ${task.stageName}` : ''}</p>
+              <p className="kicker">{task.projectName || 'Personal'}</p>
               <button type="button" className="icon-btn" onClick={onClose} aria-label="Close">×</button>
             </div>
             <h2>{task.title}</h2>
@@ -159,7 +158,6 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
                           assigneeId: reassignId,
                           dueDate: task.dueDate,
                           priority: task.priority,
-                          stageId: task.stageId || null,
                           status: task.status,
                         },
                       });
@@ -333,7 +331,7 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
                     className="stack"
                     onSubmit={(event) => {
                       event.preventDefault();
-                      run(() => api(`/tasks/${task.id}`, { method: 'PATCH', body: { ...admin, stageId: admin.stageId || null } }));
+                      run(() => api(`/tasks/${task.id}`, { method: 'PATCH', body: admin }));
                     }}
                   >
                     <Field label="Title"><input value={admin.title} onChange={(event) => setAdmin({ ...admin, title: event.target.value })} required /></Field>
@@ -354,14 +352,6 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
                         </select>
                       </Field>
                     </div>
-                    {project ? (
-                      <Field label="Stage">
-                        <select value={admin.stageId} onChange={(event) => setAdmin({ ...admin, stageId: event.target.value })}>
-                          <option value="">No stage</option>
-                          {project.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}
-                        </select>
-                      </Field>
-                    ) : null}
                     <button className="btn small" disabled={busy}>Save changes</button>
                   </form>
                 ) : null}

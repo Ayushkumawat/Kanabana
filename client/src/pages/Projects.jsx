@@ -6,8 +6,6 @@ import Field from '../components/Field';
 import Modal from '../components/Modal';
 import { formatDay } from '../util';
 
-const EMPTY_STAGE = { name: '', startDate: '', endDate: '' };
-
 export default function Projects() {
   const { user } = useAuth();
   const [projects, setProjects] = useState([]);
@@ -22,7 +20,6 @@ export default function Projects() {
     endDate: '',
     departmentIds: [],
     memberIds: [],
-    stages: [{ ...EMPTY_STAGE }],
   });
   const [formError, setFormError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -58,13 +55,10 @@ export default function Projects() {
     try {
       await api('/projects', {
         method: 'POST',
-        body: {
-          ...form,
-          stages: form.stages.filter((stage) => stage.name.trim()),
-        },
+        body: form,
       });
       setCreating(false);
-      setForm({ name: '', description: '', startDate: '', endDate: '', departmentIds: [], memberIds: [], stages: [{ ...EMPTY_STAGE }] });
+      setForm({ name: '', description: '', startDate: '', endDate: '', departmentIds: [], memberIds: [] });
       await load();
     } catch (err) {
       setFormError(err.message);
@@ -78,7 +72,7 @@ export default function Projects() {
       <div className="page-head">
         <div>
           <h1>Projects</h1>
-          <p className="lede">A project has a timeline, stages, and the teams sharing it.</p>
+          <p className="lede">A project has a timeline and the teams sharing it.</p>
         </div>
         {canCreate ? <button type="button" className="btn primary" onClick={() => setCreating(true)}>New project</button> : null}
       </div>
@@ -144,29 +138,6 @@ export default function Projects() {
                 ))}
                 {form.departmentIds.length === 0 ? <p className="hint">Choose a department first.</p> : null}
               </div>
-            </div>
-            <div className="stack">
-              <span className="field-label">Stages</span>
-              {form.stages.map((stage, index) => (
-                <div key={index} className="fields three">
-                  <input placeholder="Stage name" value={stage.name} onChange={(event) => {
-                    const stages = form.stages.slice();
-                    stages[index] = { ...stage, name: event.target.value };
-                    setForm({ ...form, stages });
-                  }} required />
-                  <input type="date" value={stage.startDate} onChange={(event) => {
-                    const stages = form.stages.slice();
-                    stages[index] = { ...stage, startDate: event.target.value };
-                    setForm({ ...form, stages });
-                  }} required />
-                  <input type="date" value={stage.endDate} onChange={(event) => {
-                    const stages = form.stages.slice();
-                    stages[index] = { ...stage, endDate: event.target.value };
-                    setForm({ ...form, stages });
-                  }} required />
-                </div>
-              ))}
-              <button type="button" className="btn ghost small" onClick={() => setForm({ ...form, stages: [...form.stages, { ...EMPTY_STAGE }] })}>Add stage</button>
             </div>
             {formError ? <p className="error">{formError}</p> : null}
             <div className="form-actions">
