@@ -40,6 +40,10 @@ import { seedIfEmpty } from './seed.js';
 import { lanAddresses, publishOfficeName } from './office.js';
 import { loadEnv } from './store.js';
 import { registerSections } from './sections.js';
+import { announcementPending } from './announcements.js';
+import { finishGoogleAuth, googleAuthUrl } from './google.js';
+import { checkMail, sendAssignmentEmail } from './mail.js';
+import { startReminders } from './reminders.js';
 
 loadEnv();
 const PORT = process.env.PORT || 4050;
@@ -199,14 +203,14 @@ function isProjectMember(projectId, userId) {
   return exists('project_members', { project_id: projectId, user_id: userId });
 }
 
+const NOT_ON_PROJECT = 'You’re not part of this project. Ask the team lead to add you.';
+
 async function canViewProject(auth, projectId) {
   if (auth.isAdmin || await isProjectMember(projectId, auth.id)) return true;
+  const project = await findOne('projects', { _id: projectId });
+  if (project?.created_by === auth.id) return true;
   const projectDepartments = await findMany('project_departments', { project_id: projectId });
-  if (!projectDepartments.length || !auth.departmentIds.length) return false;
-  return exists('user_departments', {
-    user_id: auth.id,
-    department_id: { $in: projectDepartments.map((link) => link.department_id) },
-  });
+  return projectDepartments.some((link) => auth.leadDepartmentIds.includes(link.department_id));
 }
 
 async function userInDepartments(userId, departmentIds) {
@@ -281,7 +285,12 @@ async function openRequest(task, kind, auth, note) {
     note: note || '',
     response_note: '',
     status: 'open',
+    task_title: task.title,
+    assignee_id: task.assignee_id,
+    creator_id: task.creator_id,
+    project_id: task.project_id || null,
     created_at: now(),
+    resolved_at: null,
   });
   return requestId;
 }
@@ -294,9 +303,10 @@ async function canHandleRequest(auth, row) {
   return Boolean(auth.isLead && creatorId === auth.id);
 }
 
-async function timelineSnapshot(projectId) {
-  const project = await findOne('projects', { _id: projectId });
-  return { startDate: project.start_date, endDate: project.end_date };
+function requestVerb(kind) {
+  if (kind === 'remove') return 'delete';
+  if (kind === 'edit') return 'edit';
+  return 'complete';
 }
 
 function groupBy(rows, key) {
@@ -311,12 +321,13 @@ function groupBy(rows, key) {
 async function presentProjects(rows, auth, withHistory = false) {
   if (!rows.length) return [];
   const ids = rows.map((row) => row.id);
-  const [deptLinks, memberLinks, departments, tasks, history] = await Promise.all([
+  const [deptLinks, memberLinks, departments, tasks, history, timelines] = await Promise.all([
     findMany('project_departments', { project_id: { $in: ids } }),
     findMany('project_members', { project_id: { $in: ids } }),
     findMany('departments', {}),
     findMany('tasks', { project_id: { $in: ids } }),
     withHistory ? findMany('timeline_changes', { project_id: { $in: ids } }, { sort: { created_at: -1 } }) : [],
+    findMany('project_timelines', { project_id: { $in: ids } }),
   ]);
   const deptMap = new Map(departments.map((department) => [department.id, department]));
   const userIds = new Set(rows.map((row) => row.created_by));
@@ -327,6 +338,7 @@ async function presentProjects(rows, auth, withHistory = false) {
   const membersByProject = groupBy(memberLinks, 'project_id');
   const tasksByProject = groupBy(tasks, 'project_id');
   const historyByProject = groupBy(history, 'project_id');
+  const timelinesByProject = groupBy(timelines, 'project_id');
   return rows.map((row) => {
     const projectDepartments = (linksByProject.get(row.id) || [])
       .map((link) => deptMap.get(link.department_id))
@@ -340,6 +352,33 @@ async function presentProjects(rows, auth, withHistory = false) {
       .map((member) => ({ id: member.id, name: member.name, active: Boolean(member.active) }));
     const projectTasks = tasksByProject.get(row.id) || [];
     const onTeam = projectDepartments.some((item) => auth.leadDepartmentIds.includes(item.id));
+    const savedTimelines = timelinesByProject.get(row.id) || [];
+    const teamTimelines = projectDepartments.map((department) => {
+      const saved = savedTimelines.find((item) => item.department_id === department.id);
+      const canEdit = auth.isAdmin || auth.leadDepartmentIds.includes(department.id);
+      if (!saved) {
+        return {
+          departmentId: department.id,
+          departmentName: department.name,
+          startDate: row.start_date,
+          endDate: row.end_date,
+          status: 'set',
+          reason: '',
+          canEdit,
+          pending: false,
+        };
+      }
+      return {
+        departmentId: department.id,
+        departmentName: department.name,
+        startDate: saved.start_date,
+        endDate: saved.end_date,
+        status: saved.status,
+        reason: saved.reason || '',
+        canEdit,
+        pending: saved.status !== 'set',
+      };
+    });
     const project = {
       id: row.id,
       name: row.name,
@@ -349,6 +388,7 @@ async function presentProjects(rows, auth, withHistory = false) {
       endDate: row.end_date,
       createdAt: row.created_at,
       departments: projectDepartments,
+      timelines: teamTimelines,
       members,
       taskCount: projectTasks.length,
       doneCount: projectTasks.filter((task) => task.status === 'done').length,
@@ -358,6 +398,7 @@ async function presentProjects(rows, auth, withHistory = false) {
       canDelete: auth.isAdmin || row.created_by === auth.id || onTeam,
       canAssign: auth.isAdmin || row.created_by === auth.id || onTeam,
       canEditTimeline: auth.isAdmin || onTeam,
+      canOpen: auth.isAdmin || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
       canAddTask: auth.isAdmin || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
     };
     if (!withHistory) return project;
@@ -367,6 +408,7 @@ async function presentProjects(rows, auth, withHistory = false) {
       before: JSON.parse(item.before_json),
       after: JSON.parse(item.after_json),
       createdAt: item.created_at,
+      departmentName: item.department_name || '',
       actorName: String(item.actor_name || '').trim() || users.get(item.actor_id)?.name || '',
     }));
     return { ...project, history: items };
@@ -539,7 +581,12 @@ async function writeStatus(taskId, status, previousCompletedAt) {
 async function noteStatus(task, status, auth) {
   await logActivity(auth.id, `${auth.name} moved “${task.title}” to ${STATUS_LABEL[status]}.`, task.id, task.project_id);
   if (task.status === 'review' && status !== 'review') {
-    await updateMany('task_requests', { task_id: task.id, kind: 'review', status: 'open' }, { status: status === 'done' ? 'accepted' : 'declined' });
+    const accepted = status === 'done';
+    await updateMany('task_requests', { task_id: task.id, kind: 'review', status: 'open' }, {
+      status: accepted ? 'accepted' : 'declined',
+      resolved_at: now(),
+      ...(accepted ? { response_note: 'Marked done.' } : {}),
+    });
   }
   if (status === 'review' && auth.id === task.assignee_id && !await canGovernTask(auth, task)) {
     await openRequest(task, 'review', auth, '');
@@ -598,7 +645,17 @@ async function deleteTask(taskId) {
   await updateMany('tasks', { handoff_task_id: taskId }, { handoff_task_id: null, updated_at: now() });
   await updateMany('tasks', { parent_task_id: taskId }, { parent_task_id: null });
   await deleteMany('comments', { task_id: taskId });
-  await deleteMany('task_requests', { task_id: taskId });
+  const stamp = now();
+  await updateMany('task_requests', { task_id: taskId, status: 'open', kind: 'remove' }, {
+    status: 'accepted',
+    response_note: 'The task was deleted.',
+    resolved_at: stamp,
+  });
+  await updateMany('task_requests', { task_id: taskId, status: 'open', kind: { $ne: 'remove' } }, {
+    status: 'declined',
+    response_note: 'This task was deleted.',
+    resolved_at: stamp,
+  });
   await deleteMany('departure_items', { task_id: taskId });
   await deleteMany('task_dependencies', { task_id: taskId });
   await updateMany('knowledge_items', { task_id: taskId }, { task_id: null });
@@ -622,6 +679,7 @@ async function removeProject(projectId) {
   await deleteMany('project_members', { project_id: projectId });
   await deleteMany('project_stages', { project_id: projectId });
   await deleteMany('timeline_changes', { project_id: projectId });
+  await deleteMany('project_timelines', { project_id: projectId });
   await deleteMany('knowledge_items', { project_id: projectId });
   await deleteOne('projects', { _id: projectId });
 }
@@ -650,6 +708,29 @@ app.post('/api/login', wrap(async (req, res) => {
 
 app.get('/api/me', requireAuth, wrap(async (req, res) => {
   res.json({ user: req.auth });
+}));
+
+app.patch('/api/me', requireAuth, wrap(async (req, res) => {
+  const name = readText(req.body.name, 80, 'your name', true);
+  if (name.error) return bad(res, 400, name.error);
+  const email = readEmail(req.body.email);
+  if (email.error) return bad(res, 400, email.error);
+  if (!isISODate(req.body.birthday)) return bad(res, 400, 'Choose a date of birth');
+  if (!isISODate(req.body.workAnniversary)) return bad(res, 400, 'Choose a date of joining');
+  const today = todayISO();
+  if (req.body.birthday > today) return bad(res, 400, 'Date of birth can’t be in the future');
+  if (req.body.workAnniversary > today) return bad(res, 400, 'Date of joining can’t be in the future');
+  if (await exists('users', { email: email.value, _id: { $ne: req.auth.id } })) {
+    return bad(res, 400, 'That email is already in use');
+  }
+  await updateOne('users', { _id: req.auth.id }, {
+    name: name.value,
+    email: email.value,
+    birthday: req.body.birthday,
+    work_anniversary: req.body.workAnniversary,
+  });
+  await logActivity(req.auth.id, `${name.value} updated their profile.`);
+  res.json({ user: await userContext(req.auth.id) });
 }));
 
 app.post('/api/me/password', requireAuth, wrap(async (req, res) => {
@@ -979,6 +1060,7 @@ async function moveDepartureTask(task, assignee, person, actor) {
   }
   await updateOne('tasks', { _id: task.id }, { assignee_id: assignee.id, updated_at: now() });
   await notify(assignee.id, `${actor.name} assigned “${task.title}” to you.`, task.id, task.project_id, 'board');
+  await sendAssignmentEmail(assignee, actor, task);
   await logActivity(actor.id, `${actor.name} moved “${task.title}” from ${person.name} to ${assignee.name}.`, task.id, task.project_id);
 }
 
@@ -1182,18 +1264,7 @@ app.delete('/api/departments/:id', requireAuth, requireAdmin, wrap(async (req, r
 }));
 
 app.get('/api/projects', requireAuth, wrap(async (req, res) => {
-  let rows;
-  if (req.auth.isAdmin) {
-    rows = await findMany('projects', {});
-  } else {
-    const memberships = await findMany('project_members', { user_id: req.auth.id });
-    const departmentIds = req.auth.departmentIds;
-    const byDepartment = departmentIds.length
-      ? await findMany('project_departments', { department_id: { $in: departmentIds } })
-      : [];
-    const ids = [...new Set([...memberships.map((link) => link.project_id), ...byDepartment.map((link) => link.project_id)])];
-    rows = ids.length ? await findMany('projects', { _id: { $in: ids } }) : [];
-  }
+  const rows = await findMany('projects', {});
   rows.sort((left, right) => left.start_date.localeCompare(right.start_date) || left.name.localeCompare(right.name));
   res.json({ projects: await presentProjects(rows, req.auth) });
 }));
@@ -1239,8 +1310,31 @@ app.post('/api/projects', requireAuth, wrap(async (req, res) => {
     for (const memberId of memberIds) {
       await insertOne('project_members', { _id: `${projectId}:${memberId}`, project_id: projectId, user_id: memberId });
     }
+    for (const department of foundDepartments) {
+      await insertOne('project_timelines', {
+        id: id('ptl'),
+        project_id: projectId,
+        department_id: department.id,
+        start_date: null,
+        end_date: null,
+        status: 'open',
+        reason: '',
+        set_by: null,
+        set_at: null,
+        created_at: now(),
+      });
+    }
     await logActivity(req.auth.id, `${req.auth.name} created the project “${name.value}”.`, null, projectId);
   });
+  for (const department of foundDepartments) {
+    const message = department.lead_id
+      ? `Set the ${department.name} timeline for “${name.value}”. It stays in Requests until you do.`
+      : `${department.name} is on “${name.value}” and has no team lead. Set that timeline.`;
+    const recipients = department.lead_id
+      ? [department.lead_id]
+      : (await findMany('users', { role: 'admin', active: 1 })).map((user) => user.id);
+    for (const userId of recipients) await notify(userId, message, null, projectId, 'requests');
+  }
   const row = await findOne('projects', { _id: projectId });
   res.status(201).json({ project: await presentProject(row, req.auth, true) });
 }));
@@ -1248,7 +1342,7 @@ app.post('/api/projects', requireAuth, wrap(async (req, res) => {
 app.get('/api/projects/:id', requireAuth, wrap(async (req, res) => {
   const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!await canViewProject(req.auth, row.id)) return bad(res, 403, 'You can’t see this project');
+  if (!await canViewProject(req.auth, row.id)) return bad(res, 403, NOT_ON_PROJECT);
   res.json({ project: await presentProject(row, req.auth, true) });
 }));
 
@@ -1282,36 +1376,70 @@ app.delete('/api/projects/:id', requireAuth, wrap(async (req, res) => {
 app.patch('/api/projects/:id/timeline', requireAuth, wrap(async (req, res) => {
   const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!await canViewProject(req.auth, row.id)) return bad(res, 403, 'You can’t see this project');
-  const view = await presentProject(row, req.auth);
-  if (!view.canEditTimeline) return bad(res, 403, 'Only an admin or this project’s team lead can move the timeline');
-  let reason = String(req.body.reason || '').trim();
-  if (!req.auth.isAdmin && reason.length < 8) {
-    return bad(res, 400, 'Write a short reason for the date change (at least 8 characters).');
+  if (!await canViewProject(req.auth, row.id)) return bad(res, 403, NOT_ON_PROJECT);
+  const departmentId = String(req.body.departmentId || '');
+  if (!await exists('project_departments', { project_id: row.id, department_id: departmentId })) {
+    return bad(res, 400, 'That team is not on this project');
   }
-  if (!reason) reason = 'Updated by admin';
-  if (reason.length > 500) return bad(res, 400, 'Keep the reason under 500 characters');
+  if (!req.auth.isAdmin && !req.auth.leadDepartmentIds.includes(departmentId)) {
+    return bad(res, 403, 'The team lead for this department sets its timeline');
+  }
+  const department = await findOne('departments', { _id: departmentId });
+  if (!department) return bad(res, 404, 'Department not found');
   const { startDate, endDate } = req.body;
   if (!isISODate(startDate) || !isISODate(endDate) || endDate < startDate) {
-    return bad(res, 400, 'Check the project start and end dates');
+    return bad(res, 400, 'Check the start and end dates');
   }
-  const before = await timelineSnapshot(row.id);
+  const existing = await findOne('project_timelines', { project_id: row.id, department_id: departmentId });
+  const first = !existing || existing.status === 'open';
+  let reason = String(req.body.reason || '').trim();
+  if (!first && !req.auth.isAdmin && reason.length < 8) {
+    return bad(res, 400, 'Write a short reason for the date change (at least 8 characters).');
+  }
+  if (!first && !reason) reason = 'Updated by admin';
+  if (reason.length > 500) return bad(res, 400, 'Keep the reason under 500 characters');
+  const before = { startDate: existing?.start_date || null, endDate: existing?.end_date || null };
+  const after = { startDate, endDate };
+  const savedReason = reason || 'Timeline set';
   await withTx(async () => {
-    await updateOne('projects', { _id: row.id }, { start_date: startDate, end_date: endDate });
-    const after = await timelineSnapshot(row.id);
+    if (existing) {
+      await updateOne('project_timelines', { _id: existing.id }, {
+        start_date: startDate,
+        end_date: endDate,
+        status: 'set',
+        reason: savedReason,
+        set_by: req.auth.id,
+        set_at: now(),
+      });
+    } else {
+      await insertOne('project_timelines', {
+        id: id('ptl'),
+        project_id: row.id,
+        department_id: departmentId,
+        start_date: startDate,
+        end_date: endDate,
+        status: 'set',
+        reason: savedReason,
+        set_by: req.auth.id,
+        set_at: now(),
+        created_at: now(),
+      });
+    }
     await insertOne('timeline_changes', {
       id: id('tlc'),
       project_id: row.id,
+      department_id: departmentId,
+      department_name: department.name,
       actor_id: req.auth.id,
       actor_name: null,
-      reason,
+      reason: savedReason,
       before_json: JSON.stringify(before),
       after_json: JSON.stringify(after),
       created_at: now(),
     });
-    await logActivity(req.auth.id, `${req.auth.name} changed the timeline for ${row.name}. ${reason}`, null, row.id);
+    await logActivity(req.auth.id, `${req.auth.name} set the ${department.name} timeline for ${row.name}.`, null, row.id);
   });
-  await notifyProject(row.id, req.auth, `${req.auth.name} changed the timeline for ${row.name}. ${reason}`);
+  await notifyProject(row.id, req.auth, `${req.auth.name} set the ${department.name} timeline for ${row.name} (${startDate} to ${endDate}).`);
   const fresh = await findOne('projects', { _id: row.id });
   res.json({ project: await presentProject(fresh, req.auth, true) });
 }));
@@ -1357,6 +1485,20 @@ function byDue(left, right) {
   return left.due_date.localeCompare(right.due_date) || left.title.localeCompare(right.title);
 }
 
+async function withChangeRequests(tasks) {
+  if (!tasks.length) return tasks;
+  const rows = await findMany('task_requests', {
+    task_id: { $in: tasks.map((task) => task.id) },
+    status: 'open',
+    kind: { $in: ['edit', 'remove'] },
+  });
+  const byTask = groupBy(rows, 'task_id');
+  return tasks.map((task) => ({
+    ...task,
+    changeRequests: [...new Set((byTask.get(task.id) || []).map((row) => row.kind))],
+  }));
+}
+
 app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   const scope = ['team', 'project', 'person'].includes(req.query.scope) ? req.query.scope : 'mine';
   let weekStart = null;
@@ -1368,7 +1510,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   if (scope === 'project') {
     const projectId = req.query.projectId;
     if (!projectId) return bad(res, 400, 'Choose a project');
-    if (!await canViewProject(req.auth, projectId)) return bad(res, 403, 'You can’t see this project');
+    if (!await canViewProject(req.auth, projectId)) return bad(res, 403, NOT_ON_PROJECT);
     filter = { project_id: projectId };
     weekEnd = '9999-99-99';
   } else {
@@ -1405,7 +1547,26 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
     }
     const candidates = await findMany('tasks', filter);
     let rows = candidates.filter((task) => matchesWeek(task, weekStart, weekEnd, isCurrent, includePrevious, prevStart));
-    if (isCurrent) {
+    if (isCurrent && scope === 'team') {
+      // Later work is added per person, and only when that person has nothing due
+      // this week. A shared "no To do cards" check made one move hide other people.
+      const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
+      const seen = new Set(rows.map((row) => row.id));
+      const byAssignee = new Map();
+      for (const task of candidates) {
+        if (!byAssignee.has(task.assignee_id)) byAssignee.set(task.assignee_id, []);
+        byAssignee.get(task.assignee_id).push(task);
+      }
+      for (const tasks of byAssignee.values()) {
+        const hasThisWeek = tasks.some((task) => task.due_date >= weekStart && task.due_date <= weekEnd);
+        if (hasThisWeek) continue;
+        const extra = tasks
+          .filter((task) => !seen.has(task.id) && task.status !== 'done' && task.due_date > weekEnd && task.due_date <= horizon)
+          .map((task) => ({ ...task, from_next: 1 }));
+        for (const task of extra) seen.add(task.id);
+        rows = rows.concat(extra);
+      }
+    } else if (isCurrent) {
       const hasTodo = rows.some((row) => row.status === 'upcoming' && row.due_date >= weekStart && row.due_date <= weekEnd);
       if (!hasTodo) {
         const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
@@ -1419,7 +1580,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
     rows.sort(byDue);
     const hydrated = await hydrateTasks(rows);
     return res.json({
-      tasks: hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart)),
+      tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart))),
       weekStart,
       weekEnd,
       isCurrent,
@@ -1429,7 +1590,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   const rows = (await findMany('tasks', filter)).sort(byDue);
   const hydrated = await hydrateTasks(rows);
   res.json({
-    tasks: hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart)),
+    tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart))),
     weekStart,
     weekEnd: null,
     isCurrent,
@@ -1480,6 +1641,23 @@ app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
       if (req.body.handoff) await createHandoff(createdId, req.auth, req.body.handoff);
       return createdId;
     });
+    if (assigneeId !== req.auth.id) {
+      await sendAssignmentEmail(assignee, req.auth, {
+        title: title.value,
+        description: description.value,
+        dueDate: req.body.dueDate,
+      });
+    }
+    if (req.body.handoff?.assigneeId && req.body.handoff.assigneeId !== req.auth.id) {
+      const next = await activeUser(req.body.handoff.assigneeId);
+      if (next) {
+        await sendAssignmentEmail(next, req.auth, {
+          title: req.body.handoff.title,
+          description: req.body.handoff.description || '',
+          dueDate: req.body.handoff.dueDate,
+        });
+      }
+    }
     res.status(201).json({ task: mapTask(await loadTask(taskId), '9999-99-99') });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
@@ -1624,6 +1802,11 @@ app.post('/api/tasks/:id/followup', requireAuth, wrap(async (req, res) => {
       await logActivity(req.auth.id, `${req.auth.name} assigned follow-up “${title.value}” to ${assignee.name}.`, createdId, task.project_id);
       return createdId;
     });
+    await sendAssignmentEmail(assignee, req.auth, {
+      title: title.value,
+      description: description.value,
+      dueDate: req.body.dueDate,
+    });
     res.status(201).json({ task: mapTask(await loadTask(childId), '9999-99-99') });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
@@ -1640,6 +1823,16 @@ app.post('/api/tasks/:id/handoff', requireAuth, wrap(async (req, res) => {
   }
   try {
     const childId = await withTx(() => createHandoff(task.id, req.auth, req.body));
+    if (req.body.assigneeId && req.body.assigneeId !== req.auth.id) {
+      const next = await activeUser(req.body.assigneeId);
+      if (next) {
+        await sendAssignmentEmail(next, req.auth, {
+          title: req.body.title,
+          description: req.body.description || '',
+          dueDate: req.body.dueDate,
+        });
+      }
+    }
     res.status(201).json({ task: mapTask(await loadTask(childId), '9999-99-99') });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
@@ -1707,30 +1900,48 @@ app.patch('/api/tasks/:id', requireAuth, wrap(async (req, res) => {
   });
   if (assignee.id !== task.assignee_id) {
     await notify(assignee.id, `${req.auth.name} assigned “${title.value}” to you.`, task.id, task.project_id);
+    await sendAssignmentEmail(assignee, req.auth, {
+      title: title.value,
+      description: description.value,
+      dueDate: req.body.dueDate,
+    });
   }
   await logActivity(req.auth.id, `${req.auth.name} edited “${title.value}”.`, task.id, task.project_id);
   if (req.body.status !== task.status) await noteStatus({ ...task, title: title.value }, req.body.status, req.auth);
   res.json({ task: mapTask(await loadTask(task.id), '9999-99-99') });
 }));
 
-app.post('/api/tasks/:id/removal', requireAuth, wrap(async (req, res) => {
+async function raiseChange(req, res, kind) {
   const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
   if (req.auth.id !== task.assignee_id) return bad(res, 403, 'Ask from the person this task is assigned to');
-  if (await canGovernTask(req.auth, task)) return bad(res, 400, 'You can delete this task directly');
+  if (await canGovernTask(req.auth, task)) {
+    return bad(res, 400, kind === 'edit' ? 'You can edit this task directly' : 'You can delete this task directly');
+  }
   const note = readText(req.body.note, 500, 'a note for your team lead', true);
   if (note.error) return bad(res, 400, note.error);
   if (note.value.length < 8) return bad(res, 400, 'Write a short note for your team lead (at least 8 characters)');
-  if (await exists('task_requests', { task_id: task.id, kind: 'remove', status: 'open' })) {
-    return bad(res, 400, 'You already asked your team lead to remove this');
+  if (await exists('task_requests', { task_id: task.id, kind, status: 'open' })) {
+    return bad(res, 400, kind === 'edit'
+      ? 'You already asked your team lead for edits'
+      : 'You already asked your team lead to delete this');
   }
-  await openRequest(task, 'remove', req.auth, note.value);
+  await openRequest(task, kind, req.auth, note.value);
+  const asked = kind === 'edit' ? `asked for edits on “${task.title}”` : `asked to delete “${task.title}”`;
   for (const userId of await requestRecipients(task)) {
-    await notify(userId, `${req.auth.name} asked to remove “${task.title}”. ${note.value}`, task.id, task.project_id, 'requests');
+    await notify(userId, `${req.auth.name} ${asked}. ${note.value}`, task.id, task.project_id, 'requests');
   }
-  await logActivity(req.auth.id, `${req.auth.name} asked to remove “${task.title}”.`, task.id, task.project_id);
-  res.status(201).json({ ok: true });
+  await logActivity(req.auth.id, `${req.auth.name} ${asked}.`, task.id, task.project_id);
+  return res.status(201).json({ ok: true });
+}
+
+app.post('/api/tasks/:id/change', requireAuth, wrap(async (req, res) => {
+  const kind = req.body.kind === 'edit' || req.body.kind === 'remove' ? req.body.kind : '';
+  if (!kind) return bad(res, 400, 'Say whether this is an edit or a deletion');
+  return raiseChange(req, res, kind);
 }));
+
+app.post('/api/tasks/:id/removal', requireAuth, wrap(async (req, res) => raiseChange(req, res, 'remove')));
 
 app.delete('/api/tasks/:id', requireAuth, wrap(async (req, res) => {
   const task = await rawTask(req.params.id);
@@ -1741,46 +1952,86 @@ app.delete('/api/tasks/:id', requireAuth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/api/requests', requireAuth, wrap(async (req, res) => {
-  const open = (await findMany('task_requests', { status: 'open' })).sort((left, right) => right.created_at.localeCompare(left.created_at));
-  const tasks = await findMany('tasks', { _id: { $in: open.map((request) => request.task_id) } });
+async function visibleTaskRequests(auth) {
+  const stored = (await findMany('task_requests', {})).sort((left, right) => right.created_at.localeCompare(left.created_at));
+  if (!stored.length) return [];
+  const taskIds = [...new Set(stored.map((request) => request.task_id).filter(Boolean))];
+  const tasks = taskIds.length ? await findMany('tasks', { _id: { $in: taskIds } }) : [];
   const taskMap = new Map(tasks.map((task) => [task.id, task]));
   const users = await usersByIds([
-    ...open.map((request) => request.requester_id),
+    ...stored.map((request) => request.requester_id),
+    ...stored.map((request) => request.assignee_id),
     ...tasks.map((task) => task.assignee_id),
   ]);
-  const rows = open.flatMap((request) => {
-    const task = taskMap.get(request.task_id);
-    if (!task) return [];
-    return [{
-      ...request,
-      assignee_id: task.assignee_id,
-      creator_id: task.creator_id,
+  const requests = [];
+  for (const request of stored) {
+    const task = taskMap.get(request.task_id) || null;
+    const row = {
+      assignee_id: task?.assignee_id || request.assignee_id,
+      creator_id: task?.creator_id || request.creator_id,
+    };
+    const mine = request.requester_id === auth.id;
+    const handle = await canHandleRequest(auth, row);
+    if (!mine && !handle) continue;
+    requests.push({
+      id: request.id,
+      kind: request.kind,
+      note: request.note || '',
+      responseNote: request.response_note || '',
+      status: request.status || 'open',
+      createdAt: request.created_at,
+      resolvedAt: request.resolved_at || null,
       requesterId: request.requester_id,
       requesterName: users.get(request.requester_id)?.name || '',
-      taskId: task.id,
-      taskTitle: task.title,
-      taskStatus: task.status,
-      assigneeName: users.get(task.assignee_id)?.name || '',
-    }];
-  });
-  const requests = [];
-  for (const row of rows) {
-    if (!(req.auth.isAdmin || row.requesterId === req.auth.id || await canHandleRequest(req.auth, row))) continue;
-    requests.push({
-      id: row.id,
-      kind: row.kind,
-      note: row.note,
-      createdAt: row.created_at,
-      requesterId: row.requesterId,
-      requesterName: row.requesterName,
-      taskId: row.taskId,
-      taskTitle: row.taskTitle,
-      taskStatus: row.taskStatus,
-      assigneeName: row.assigneeName,
-      canAnswer: req.auth.isAdmin || (await canHandleRequest(req.auth, row) && row.requesterId !== req.auth.id),
+      taskId: request.task_id,
+      taskTitle: task?.title || request.task_title || 'Task',
+      taskStatus: task?.status || null,
+      assigneeName: users.get(row.assignee_id)?.name || '',
+      taskMissing: !task,
+      canAnswer: request.status === 'open' && handle && !mine && Boolean(task),
     });
   }
+  return requests;
+}
+
+async function visibleTimelineRequests(auth) {
+  if (!auth.isAdmin && !auth.leadDepartmentIds.length) return [];
+  const stored = await findMany('project_timelines', auth.isAdmin ? {} : { department_id: { $in: auth.leadDepartmentIds } });
+  if (!stored.length) return [];
+  const projects = await findMany('projects', { _id: { $in: [...new Set(stored.map((row) => row.project_id))] } });
+  const departments = await findMany('departments', { _id: { $in: [...new Set(stored.map((row) => row.department_id))] } });
+  const projectMap = new Map(projects.map((project) => [project.id, project]));
+  const departmentMap = new Map(departments.map((department) => [department.id, department]));
+  return stored.flatMap((row) => {
+    const project = projectMap.get(row.project_id);
+    const department = departmentMap.get(row.department_id);
+    if (!project || !department) return [];
+    const open = row.status === 'open';
+    return [{
+      id: row.id,
+      kind: 'timeline',
+      note: open ? '' : (row.reason || ''),
+      responseNote: '',
+      status: open ? 'open' : 'set',
+      createdAt: row.created_at,
+      resolvedAt: row.set_at || null,
+      projectId: project.id,
+      projectName: project.name,
+      departmentId: department.id,
+      departmentName: department.name,
+      startDate: row.start_date,
+      endDate: row.end_date,
+      canAnswer: open && (auth.isAdmin || auth.leadDepartmentIds.includes(department.id)),
+    }];
+  });
+}
+
+app.get('/api/requests', requireAuth, wrap(async (req, res) => {
+  const [tasks, timelines] = await Promise.all([
+    visibleTaskRequests(req.auth),
+    visibleTimelineRequests(req.auth),
+  ]);
+  const requests = [...tasks, ...timelines].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   res.json({ requests });
 }));
 
@@ -1792,13 +2043,36 @@ app.post('/api/requests/:id/decline', requireAuth, wrap(async (req, res) => {
   if (!await canHandleRequest(req.auth, row)) return bad(res, 403, 'Only the team lead can answer this');
   const note = readText(req.body.note, 500, 'a note');
   if (note.error) return bad(res, 400, note.error);
-  await updateOne('task_requests', { _id: row.id }, { status: 'declined', response_note: note.value });
-  const label = row.kind === 'remove' ? 'remove' : 'review';
+  await updateOne('task_requests', { _id: row.id }, { status: 'declined', response_note: note.value, resolved_at: now() });
+  const label = requestVerb(row.kind);
   const message = note.value
     ? `${req.auth.name} declined the request to ${label} “${row.title}”. Note: ${note.value}`
     : `${req.auth.name} declined the request to ${label} “${row.title}”.`;
   await notify(row.requester_id, message, row.task_id, row.project_id, 'requests');
   await logActivity(req.auth.id, message, row.task_id, row.project_id);
+  res.json({ ok: true });
+}));
+
+app.post('/api/requests/:id/accept', requireAuth, wrap(async (req, res) => {
+  const request = await findOne('task_requests', { _id: req.params.id });
+  const task = request ? await findOne('tasks', { _id: request.task_id }) : null;
+  if (!request || request.status !== 'open') return bad(res, 404, 'Request not found');
+  if (request.kind !== 'edit') return bad(res, 400, 'Open the task to finish this request');
+  if (!task) return bad(res, 404, 'That task is already gone');
+  const row = { ...request, assignee_id: task.assignee_id, creator_id: task.creator_id };
+  if (!await canHandleRequest(req.auth, row)) return bad(res, 403, 'Only the team lead can answer this');
+  const note = readText(req.body.note, 500, 'a note');
+  if (note.error) return bad(res, 400, note.error);
+  await updateOne('task_requests', { _id: request.id }, {
+    status: 'accepted',
+    response_note: note.value || 'Edits done.',
+    resolved_at: now(),
+  });
+  const message = note.value
+    ? `${req.auth.name} accepted the edit request on “${task.title}”. Note: ${note.value}`
+    : `${req.auth.name} accepted the edit request on “${task.title}”.`;
+  await notify(request.requester_id, message, task.id, task.project_id, 'requests');
+  await logActivity(req.auth.id, message, task.id, task.project_id);
   res.json({ ok: true });
 }));
 
@@ -1969,7 +2243,14 @@ app.post('/api/recurring', requireAuth, wrap(async (req, res) => {
     created_at: now(),
   });
   await logActivity(req.auth.id, `${req.auth.name} set “${title.value}” to repeat.`, null, projectId);
-  if (assigneeId !== req.auth.id) await notify(assigneeId, `${req.auth.name} set a repeating task for you: “${title.value}”.`, null, projectId, 'repeating');
+  if (assigneeId !== req.auth.id) {
+    await notify(assigneeId, `${req.auth.name} set a repeating task for you: “${title.value}”.`, null, projectId, 'repeating');
+    await sendAssignmentEmail(assignee, req.auth, {
+      title: title.value,
+      description: description.value,
+      dueDate: 'each time it repeats',
+    });
+  }
   await prepareWeek();
   const [rule] = await hydrateRules([await findOne('recurring_rules', { _id: ruleId })]);
   res.status(201).json({ rule: mapRule(rule) });
@@ -2008,6 +2289,17 @@ app.patch('/api/recurring/:id', requireAuth, wrap(async (req, res) => {
     project_id: projectId,
     active,
   });
+  if (assigneeId !== rule.assignee_id && assigneeId !== req.auth.id) {
+    const next = await activeUser(assigneeId);
+    if (next) {
+      await notify(next.id, `${req.auth.name} set the repeating task “${title.value}” for you.`, null, projectId, 'repeating');
+      await sendAssignmentEmail(next, req.auth, {
+        title: title.value,
+        description: description.value,
+        dueDate: 'each time it repeats',
+      });
+    }
+  }
   await prepareWeek();
   const [fresh] = await hydrateRules([await findOne('recurring_rules', { _id: rule.id })]);
   res.json({ rule: mapRule(fresh) });
@@ -2176,7 +2468,8 @@ app.get('/api/notifications', requireAuth, wrap(async (req, res) => {
   ]);
   const areas = {};
   for (const row of grouped) areas[row.area] = row.n;
-  res.json({ notifications, unreadCount, areas });
+  const announcementPendingCount = await announcementPending(req.auth);
+  res.json({ notifications, unreadCount, areas, announcementPending: announcementPendingCount });
 }));
 
 app.post('/api/notifications/seen', requireAuth, wrap(async (req, res) => {
@@ -2319,6 +2612,8 @@ async function main() {
   if (process.env.SEED_DEMO === '1') await seedIfEmpty();
   else if (process.env.BOOTSTRAP_ADMIN_EMAIL) await bootstrapAdmin();
   await prepareWeek();
+  await checkMail();
+  startReminders();
   const officeAddresses = lanAddresses();
   if (officeAddresses[0]) publishOfficeName(officeAddresses[0]);
   const server = app.listen(PORT, '0.0.0.0', () => {

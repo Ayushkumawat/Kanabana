@@ -9,6 +9,7 @@ import {
   findMany,
   findOne,
   id,
+  insertIgnore,
   insertOne,
   logActivity,
   notify,
@@ -18,6 +19,10 @@ import {
   usersByIds,
   withTx,
 } from './db.js';
+import { audienceUsers, mustAck } from './announcements.js';
+import { sendDependencyEmail } from './mail.js';
+import { createGoogleMeet, deleteGoogleEvent } from './google.js';
+import { isTime, sendInvites } from './meetings.js';
 
 const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'uploads');
 const ALLOWED = new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt', 'md', 'zip']);
@@ -410,6 +415,23 @@ export function registerSections(app, ctx) {
       created_at: now(),
     });
     await notify(person.id, `${req.auth.name} needs you on “${task.title}”. ${note.value}`, task.id, task.project_id, 'dependencies');
+    await sendDependencyEmail(person, req.auth, task, note.value);
+    const leads = await findMany('user_departments', { user_id: person.id });
+    if (leads.length) {
+      const departments = await findMany('departments', { _id: { $in: leads.map((link) => link.department_id) } });
+      const told = new Set([person.id, req.auth.id]);
+      for (const department of departments) {
+        if (!department.lead_id || told.has(department.lead_id)) continue;
+        told.add(department.lead_id);
+        await notify(
+          department.lead_id,
+          `${req.auth.name} is waiting on ${person.name} for “${task.title}”. ${note.value}`,
+          task.id,
+          task.project_id,
+          'dependencies',
+        );
+      }
+    }
     await logActivity(req.auth.id, `${req.auth.name} asked ${person.name} for help on “${task.title}”.`, task.id, task.project_id);
     res.status(201).json({ ok: true });
   }));
@@ -798,5 +820,177 @@ export function registerSections(app, ctx) {
     }
     await updateOne('reports', { _id: row.id }, { status });
     res.json({ reports: await reportList() });
+  }));
+
+  function audienceLabel(row, departments, users) {
+    if (row.audience === 'everyone') return 'Everyone';
+    if (row.audience === 'teams') {
+      const names = (row.department_ids || [])
+        .map((departmentId) => departments.get(departmentId)?.name)
+        .filter(Boolean);
+      return names.length ? names.join(', ') : 'Selected teams';
+    }
+    const names = (row.user_ids || []).map((userId) => users.get(userId)?.name).filter(Boolean);
+    return names.length ? names.join(', ') : 'Selected people';
+  }
+
+  app.get('/api/announcements', requireAuth, wrap(async (req, res) => {
+    const rows = (await findMany('announcements', {})).sort((left, right) => right.created_at.localeCompare(left.created_at));
+    const acks = await findMany('announcement_acks', { announcement_id: { $in: rows.map((row) => row.id) } });
+    const departments = new Map((await findMany('departments', {})).map((department) => [department.id, department]));
+    const users = await usersByIds([
+      ...rows.map((row) => row.author_id),
+      ...rows.flatMap((row) => row.user_ids || []),
+      ...acks.map((ack) => ack.user_id),
+    ]);
+    const mine = new Set(acks.filter((ack) => ack.user_id === req.auth.id).map((ack) => ack.announcement_id));
+    const announcements = [];
+    for (const row of rows) {
+      const audience = await audienceUsers(row);
+      const audienceIds = new Set(audience.map((person) => person.id));
+      const waiting = audience.filter((person) => !acks.some((ack) => ack.announcement_id === row.id && ack.user_id === person.id));
+      announcements.push({
+        id: row.id,
+        title: row.title,
+        body: row.body,
+        audience: row.audience,
+        audienceLabel: audienceLabel(row, departments, users),
+        authorId: row.author_id,
+        authorName: users.get(row.author_id)?.name || '',
+        createdAt: row.created_at,
+        needsAck: mustAck(row, req.auth) && audienceIds.has(req.auth.id),
+        acked: mine.has(row.id),
+        acknowledged: audience.length - waiting.length,
+        audienceSize: audience.length,
+        waiting: waiting.map((person) => person.name),
+      });
+    }
+    res.json({ announcements });
+  }));
+
+  app.post('/api/announcements', requireAuth, wrap(async (req, res) => {
+    const title = readText(req.body.title, 140, 'a title', true);
+    if (title.error) return bad(res, 400, title.error);
+    const body = readText(req.body.body, 4000, 'the announcement', true);
+    if (body.error) return bad(res, 400, body.error);
+    const audience = ['everyone', 'teams', 'people'].includes(req.body.audience) ? req.body.audience : 'everyone';
+    let departmentIds = [];
+    let userIds = [];
+    if (audience === 'teams') {
+      departmentIds = uniqueList(req.body.departmentIds);
+      if (!departmentIds.length) return bad(res, 400, 'Choose at least one team');
+      const found = await findMany('departments', { _id: { $in: departmentIds } });
+      if (found.length !== departmentIds.length) return bad(res, 400, 'Choose a real team');
+    }
+    if (audience === 'people') {
+      userIds = uniqueList(req.body.userIds);
+      if (!userIds.length) return bad(res, 400, 'Choose at least one person');
+      const found = await findMany('users', { _id: { $in: userIds }, active: 1 });
+      if (found.length !== userIds.length) return bad(res, 400, 'Choose active people');
+    }
+    const announcementId = id('ann');
+    const row = {
+      id: announcementId,
+      title: title.value,
+      body: body.value,
+      audience,
+      department_ids: departmentIds,
+      user_ids: userIds,
+      author_id: req.auth.id,
+      created_at: now(),
+    };
+    await insertOne('announcements', row);
+    const people = await audienceUsers(row);
+    for (const person of people) {
+      if (person.id === req.auth.id) continue;
+      await notify(person.id, `${req.auth.name} posted an announcement: “${title.value}”.`, null, null, 'announcements');
+    }
+    await logActivity(req.auth.id, `${req.auth.name} posted the announcement “${title.value}”.`);
+    res.status(201).json({ id: announcementId });
+  }));
+
+  app.post('/api/announcements/:id/ack', requireAuth, wrap(async (req, res) => {
+    const row = await findOne('announcements', { _id: req.params.id });
+    if (!row) return bad(res, 404, 'Announcement not found');
+    if (!mustAck(row, req.auth)) return bad(res, 400, 'This announcement is not assigned to you');
+    await insertIgnore('announcement_acks', {
+      _id: `${row.id}:${req.auth.id}`,
+      announcement_id: row.id,
+      user_id: req.auth.id,
+      created_at: now(),
+    });
+    res.json({ ok: true });
+  }));
+
+  app.get('/api/meetings', requireAuth, wrap(async (req, res) => {
+    const rows = (await findMany('meetings', {})).sort((left, right) => right.day.localeCompare(left.day) || right.start_time.localeCompare(left.start_time));
+    const visible = rows.filter((row) => req.auth.isAdmin || row.organizer_id === req.auth.id || (row.attendee_ids || []).includes(req.auth.id));
+    const users = await usersByIds(visible.flatMap((row) => [row.organizer_id, ...(row.attendee_ids || [])]));
+    res.json({
+      meetings: visible.map((row) => ({
+        id: row.id,
+        title: row.title,
+        agenda: row.agenda,
+        day: row.day,
+        startTime: row.start_time,
+        endTime: row.end_time,
+        organizerId: row.organizer_id,
+        organizerName: users.get(row.organizer_id)?.name || '',
+        meetUrl: row.meet_url || '',
+        people: (row.attendee_ids || []).map((userId) => users.get(userId)?.name).filter(Boolean),
+        createdAt: row.created_at,
+      })),
+    });
+  }));
+
+  app.post('/api/meetings', requireAuth, wrap(async (req, res) => {
+    const title = readText(req.body.title, 140, 'a title', true);
+    if (title.error) return bad(res, 400, title.error);
+    const agenda = readText(req.body.agenda, 4000, 'the agenda', true);
+    if (agenda.error) return bad(res, 400, agenda.error);
+    if (!isISODate(req.body.day)) return bad(res, 400, 'Choose a date');
+    if (!isTime(req.body.startTime) || !isTime(req.body.endTime)) return bad(res, 400, 'Choose a start and end time');
+    if (req.body.endTime <= req.body.startTime) return bad(res, 400, 'The end time needs to be after the start');
+    const userIds = uniqueList(req.body.userIds);
+    if (!userIds.includes(req.auth.id)) userIds.push(req.auth.id);
+    const people = await findMany('users', { _id: { $in: userIds }, active: 1 });
+    if (people.length !== userIds.length) return bad(res, 400, 'Choose active people');
+    if (people.length < 2) return bad(res, 400, 'Choose at least one other person');
+    const meeting = {
+      id: id('mtg'),
+      title: title.value,
+      agenda: agenda.value,
+      day: req.body.day,
+      start_time: req.body.startTime,
+      end_time: req.body.endTime,
+      organizer_id: req.auth.id,
+      organizer_name: req.auth.name,
+      attendee_ids: userIds,
+      created_at: now(),
+    };
+    let meet;
+    try {
+      meet = await createGoogleMeet(meeting);
+    } catch (error) {
+      return bad(res, error.status || 502, error.message);
+    }
+    meeting.meet_url = meet.meetUrl;
+    meeting.google_event_id = meet.eventId;
+    await insertOne('meetings', meeting);
+    const result = await sendInvites(meeting, people);
+    if (!result.sent) {
+      await deleteOne('meetings', { _id: meeting.id });
+      await deleteGoogleEvent(meet.eventId);
+      return bad(res, 502, 'The invitation email could not be sent. Check the mail settings and try again.');
+    }
+    await logActivity(req.auth.id, `${req.auth.name} scheduled “${title.value}”.`);
+    for (const person of people) {
+      if (person.id === req.auth.id) continue;
+      await notify(person.id, `${req.auth.name} scheduled “${title.value}” on ${meeting.day} at ${meeting.start_time}.`, null, null, 'meetings');
+    }
+    res.status(201).json({
+      id: meeting.id,
+      warning: result.failed.length ? `Saved, but the invitation did not reach ${result.failed.join(', ')}.` : '',
+    });
   }));
 }

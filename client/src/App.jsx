@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { useAuth } from './auth';
 import Layout from './components/Layout';
+import Announcements from './pages/Announcements';
 import Attendance from './pages/Attendance';
 import Board from './pages/Board';
 import Chores from './pages/Chores';
@@ -9,6 +10,7 @@ import Directory from './pages/Directory';
 import Hiring from './pages/Hiring';
 import Knowledge from './pages/Knowledge';
 import Login from './pages/Login';
+import Meetings from './pages/Meetings';
 import People from './pages/People';
 import ProjectDetail from './pages/ProjectDetail';
 import Projects from './pages/Projects';
@@ -33,6 +35,8 @@ export default function App() {
         <Route path="/team" element={<Board key="team" scope="team" />} />
         <Route path="/people" element={<People />} />
         <Route path="/projects" element={<Projects />} />
+        <Route path="/announcements" element={<Announcements />} />
+        <Route path="/meetings" element={<Meetings />} />
         <Route path="/requests" element={<Requests />} />
         <Route path="/chores" element={<Chores />} />
         <Route path="/attendance" element={<Attendance />} />

@@ -265,5 +265,11 @@ export async function ensureIndexes() {
   await database.collection('report_shots').createIndex({ report_id: 1 });
   await database.collection('tenders').createIndex({ last_date: 1 });
   await database.collection('timeline_changes').createIndex({ project_id: 1, created_at: -1 });
+  await database.collection('project_timelines').createIndex({ project_id: 1, department_id: 1 }, { unique: true });
+  await database.collection('project_timelines').createIndex({ department_id: 1, status: 1 });
   await database.collection('recurring_rules').createIndex({ assignee_id: 1 });
+  await database.collection('announcements').createIndex({ created_at: -1 });
+  await database.collection('announcement_acks').createIndex({ announcement_id: 1, user_id: 1 }, { unique: true });
+  await database.collection('announcement_acks').createIndex({ user_id: 1 });
+  await database.collection('meetings').createIndex({ day: 1, start_time: 1 });
 }

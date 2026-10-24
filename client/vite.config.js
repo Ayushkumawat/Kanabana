@@ -9,7 +9,7 @@ export default defineConfig(() => ({
     port: 5173,
     allowedHosts: true,
     proxy: {
-      '/api': 'http://127.0.0.1:4050',
+      '/api': process.env.VITE_API || 'http://127.0.0.1:4050',
     },
   },
 }));

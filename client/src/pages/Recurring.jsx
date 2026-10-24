@@ -28,7 +28,7 @@ export default function Recurring() {
   useEffect(() => {
     load();
     api('/users').then((data) => setPeople(data.users.filter((person) => person.active))).catch(() => {});
-    api('/projects').then((data) => setProjects(data.projects.filter((project) => project.status !== 'done'))).catch(() => {});
+    api('/projects').then((data) => setProjects(data.projects.filter((project) => project.canAddTask && project.status !== 'done'))).catch(() => {});
   }, []);
 
   const assignable = user.isAdmin

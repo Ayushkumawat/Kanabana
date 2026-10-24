@@ -19,6 +19,7 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
   const [followup, setFollowup] = useState({ assigneeId: '', title: '', description: '', dueDate: '' });
   const [reassignId, setReassignId] = useState('');
   const [removalNote, setRemovalNote] = useState('');
+  const [editNote, setEditNote] = useState('');
   const [knowledge, setKnowledge] = useState({ title: '', link: '', note: '', file: null });
   const [depend, setDepend] = useState({ dependsOnId: '', note: '' });
 
@@ -94,6 +95,7 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
   const statusChoices = task ? COLUMNS.filter((column) => column.id === task.status || moves.includes(column.id)) : [];
   const peoplePool = project ? project.members.filter((member) => member.active !== false) : people;
   const removal = data?.requests?.find((item) => item.kind === 'remove');
+  const editRequest = data?.requests?.find((item) => item.kind === 'edit');
 
   return (
     <div className="drawer-back" onMouseDown={onClose}>
@@ -120,8 +122,11 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
             {task.status === 'review' && governs ? (
               <div className="banner ready">This is waiting on review. Mark it done when the work is ready.</div>
             ) : null}
+            {editRequest ? (
+              <div className="banner wait">{editRequest.requesterName} asked for edits. {editRequest.note}</div>
+            ) : null}
             {removal ? (
-              <div className="banner wait">{removal.requesterName} asked to remove this. {removal.note}</div>
+              <div className="banner wait">{removal.requesterName} asked to delete this. {removal.note}</div>
             ) : null}
             {moves.length ? (
               <Field label="Move to" hint={governs ? 'You can mark this done.' : 'To do, then In progress, then Review. Your team lead marks it done.'}>
@@ -302,24 +307,44 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
             <details className="fold">
               <summary>Edit or remove</summary>
             {user.id === task.assigneeId && !governs ? (
-              removal ? <p className="hint">Waiting on your team lead to answer the removal request.</p> : (
-                <form
-                  className="stack"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    run(async () => {
-                      await api(`/tasks/${task.id}/removal`, { method: 'POST', body: { note: removalNote } });
-                      setRemovalNote('');
-                      toast('Sent to your team lead');
-                    });
-                  }}
-                >
-                  <Field label="Ask your team lead to remove this" hint="Include a short note. You can’t delete it yourself.">
-                    <textarea value={removalNote} onChange={(event) => setRemovalNote(event.target.value)} required minLength={8} />
-                  </Field>
-                  <button className="btn ghost small" disabled={busy}>Send request</button>
-                </form>
-              )
+              <div className="stack">
+                {editRequest ? <p className="hint">Waiting on your team lead to answer the edit request.</p> : (
+                  <form
+                    className="stack"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      run(async () => {
+                        await api(`/tasks/${task.id}/change`, { method: 'POST', body: { kind: 'edit', note: editNote } });
+                        setEditNote('');
+                        toast('Edit request sent to your team lead');
+                      });
+                    }}
+                  >
+                    <Field label="Ask for edits" hint="Say what should change. Your team lead sees this as an edit request.">
+                      <textarea value={editNote} onChange={(event) => setEditNote(event.target.value)} required minLength={8} />
+                    </Field>
+                    <button className="btn ghost small" disabled={busy}>Send edit request</button>
+                  </form>
+                )}
+                {removal ? <p className="hint">Waiting on your team lead to answer the delete request.</p> : (
+                  <form
+                    className="stack"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      run(async () => {
+                        await api(`/tasks/${task.id}/change`, { method: 'POST', body: { kind: 'remove', note: removalNote } });
+                        setRemovalNote('');
+                        toast('Delete request sent to your team lead');
+                      });
+                    }}
+                  >
+                    <Field label="Ask to delete" hint="Your team lead sees this as a delete request. You can’t delete it yourself.">
+                      <textarea value={removalNote} onChange={(event) => setRemovalNote(event.target.value)} required minLength={8} />
+                    </Field>
+                    <button className="btn ghost small" disabled={busy}>Send delete request</button>
+                  </form>
+                )}
+              </div>
             ) : null}
             {governs && admin ? (
               <section className="stack">

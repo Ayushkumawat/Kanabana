@@ -21,6 +21,8 @@ const GROUPS = [
   {
     label: 'Office',
     links: [
+      { to: '/announcements', label: 'Announcements', area: 'announcements' },
+      { to: '/meetings', label: 'Meetings', area: 'meetings' },
       { to: '/requests', label: 'Requests', area: 'requests' },
       { to: '/chores', label: 'Chores', area: 'chores' },
       { to: '/knowledge', label: 'Knowledge', area: 'knowledge' },
@@ -73,16 +75,23 @@ function areaFor(pathname) {
 }
 
 export default function Layout() {
-  const { user, logout } = useAuth();
+  const { user, logout, setUser } = useAuth();
   const toast = useToast();
   const navigate = useNavigate();
   const location = useLocation();
-  const [notes, setNotes] = useState({ notifications: [], unreadCount: 0, areas: {} });
+  const [notes, setNotes] = useState({ notifications: [], unreadCount: 0, areas: {}, announcementPending: 0 });
+  const [noteTick, setNoteTick] = useState(0);
   const [today, setToday] = useState(null);
   const [clockBusy, setClockBusy] = useState(false);
   const [notesOpen, setNotesOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileName, setProfileName] = useState('');
+  const [profileEmail, setProfileEmail] = useState('');
+  const [profileBirthday, setProfileBirthday] = useState('');
+  const [profileJoined, setProfileJoined] = useState('');
+  const [profileError, setProfileError] = useState('');
   const [currentPassword, setCurrentPassword] = useState('');
   const [nextPassword, setNextPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -111,7 +120,13 @@ export default function Layout() {
       stop = true;
       clearInterval(timer);
     };
-  }, [user.id, location.pathname]);
+  }, [user.id, location.pathname, noteTick]);
+
+  useEffect(() => {
+    const bump = () => setNoteTick((value) => value + 1);
+    window.addEventListener('kanabana-notes', bump);
+    return () => window.removeEventListener('kanabana-notes', bump);
+  }, []);
 
   useEffect(() => {
     api('/attendance/today').then((data) => setToday(data.record)).catch(() => {});
@@ -157,7 +172,9 @@ export default function Layout() {
 
   function openNote(note) {
     setNotesOpen(false);
-    if (note.area === 'chores') navigate('/chores');
+    if (note.area === 'announcements') navigate('/announcements');
+    else if (note.area === 'meetings') navigate('/meetings');
+    else if (note.area === 'chores') navigate('/chores');
     else if (note.area === 'requests') navigate('/requests');
     else if (note.area === 'repeating') navigate('/repeating');
     else if (note.area === 'knowledge') navigate('/knowledge');
@@ -166,6 +183,40 @@ export default function Layout() {
     else if (note.area === 'hiring') navigate('/hiring');
     else if (note.taskId) navigate({ pathname: '/', search: `?task=${note.taskId}` });
     else if (note.projectId) navigate(`/projects/${note.projectId}`);
+  }
+
+  function openProfile() {
+    setMenuOpen(false);
+    setProfileName(user.name || '');
+    setProfileEmail(user.email || '');
+    setProfileBirthday(user.birthday || '');
+    setProfileJoined(user.workAnniversary || '');
+    setProfileError('');
+    setProfileOpen(true);
+  }
+
+  async function saveProfile(event) {
+    event.preventDefault();
+    setBusy(true);
+    setProfileError('');
+    try {
+      const data = await api('/me', {
+        method: 'PATCH',
+        body: {
+          name: profileName,
+          email: profileEmail,
+          birthday: profileBirthday,
+          workAnniversary: profileJoined,
+        },
+      });
+      setUser(data.user);
+      setProfileOpen(false);
+      toast('Profile updated');
+    } catch (error) {
+      setProfileError(error.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function savePassword(event) {
@@ -207,7 +258,7 @@ export default function Layout() {
                 {links.map((item) => (
                   <NavLink key={item.to} to={item.to} end={item.to === '/'} className={({ isActive }) => (isActive ? 'active' : '')}>
                     {item.label}
-                    {notes.areas?.[item.area] ? <span className="nav-dot" aria-label="New" /> : null}
+                    {(item.area === 'announcements' ? notes.announcementPending : notes.areas?.[item.area]) ? <span className="nav-dot" aria-label="New" /> : null}
                   </NavLink>
                 ))}
               </div>
@@ -270,6 +321,7 @@ export default function Layout() {
               {menuOpen ? (
                 <div className="popover menu">
                   <p className="muted pad">{user.email}</p>
+                  <button type="button" className="menu-item" onClick={openProfile}>Edit profile</button>
                   <button type="button" className="menu-item" onClick={() => { setMenuOpen(false); setPasswordOpen(true); }}>Change password</button>
                   <button type="button" className="menu-item" onClick={() => { logout(); navigate('/login'); }}>Log out</button>
                 </div>
@@ -281,6 +333,31 @@ export default function Layout() {
           <Outlet />
         </div>
       </div>
+      {profileOpen ? (
+        <Modal title="Edit profile" onClose={() => setProfileOpen(false)}>
+          <form className="stack" onSubmit={saveProfile}>
+            <Field label="Name">
+              <input value={profileName} onChange={(event) => setProfileName(event.target.value)} maxLength={80} required />
+            </Field>
+            <Field label="Email" hint="This is also the email you use to sign in.">
+              <input type="email" value={profileEmail} onChange={(event) => setProfileEmail(event.target.value)} maxLength={120} required />
+            </Field>
+            <div className="fields two">
+              <Field label="Date of birth">
+                <input type="date" value={profileBirthday} onChange={(event) => setProfileBirthday(event.target.value)} required />
+              </Field>
+              <Field label="Date of joining">
+                <input type="date" value={profileJoined} onChange={(event) => setProfileJoined(event.target.value)} required />
+              </Field>
+            </div>
+            {profileError ? <p className="error">{profileError}</p> : null}
+            <div className="form-actions">
+              <button type="button" className="btn ghost" onClick={() => setProfileOpen(false)}>Cancel</button>
+              <button className="btn primary" disabled={busy}>{busy ? 'Saving…' : 'Save profile'}</button>
+            </div>
+          </form>
+        </Modal>
+      ) : null}
       {passwordOpen ? (
         <Modal title="Change password" onClose={() => setPasswordOpen(false)}>
           <form className="stack" onSubmit={savePassword}>

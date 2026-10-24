@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api';
-import { useAuth } from '../auth';
+import { useAuth, useToast } from '../auth';
 import Field from '../components/Field';
 import Modal from '../components/Modal';
 import { formatDay } from '../util';
 
+const LOCKED = 'You’re not part of this project. Ask the team lead to add you.';
+
 export default function Projects() {
   const { user } = useAuth();
+  const toast = useToast();
   const [projects, setProjects] = useState([]);
   const [departments, setDepartments] = useState([]);
   const [people, setPeople] = useState([]);
@@ -23,6 +26,7 @@ export default function Projects() {
   });
   const [formError, setFormError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [blocked, setBlocked] = useState('');
 
   function load() {
     return api('/projects').then((data) => setProjects(data.projects)).catch((err) => setError(err.message));
@@ -72,17 +76,18 @@ export default function Projects() {
       <div className="page-head">
         <div>
           <h1>Projects</h1>
-          <p className="lede">A project has a timeline and the teams sharing it.</p>
+          <p className="lede">Every project is listed. You can open the ones you’re on. Each team on a project sets its own timeline.</p>
         </div>
         {canCreate ? <button type="button" className="btn primary" onClick={() => setCreating(true)}>New project</button> : null}
       </div>
       {error ? <p className="banner">{error}</p> : null}
+      {blocked ? <p className="banner">{LOCKED}</p> : null}
       {projects.length === 0 ? <p className="muted">No projects yet. An admin or a team lead can add one.</p> : null}
       <div className="project-grid">
         {projects.map((project) => {
           const pct = project.taskCount ? Math.round((project.doneCount / project.taskCount) * 100) : 0;
-          return (
-            <Link key={project.id} to={`/projects/${project.id}`} className="project-card">
+          const body = (
+            <>
               <div className="row-between">
                 <span className={`pill ${project.status}`}>{project.status}</span>
                 <span className="muted">{formatDay(project.startDate)} – {formatDay(project.endDate)}</span>
@@ -94,6 +99,27 @@ export default function Projects() {
               </div>
               <div className="progress" aria-hidden="true"><span style={{ width: `${pct}%` }} /></div>
               <small className="muted">{project.doneCount} of {project.taskCount} done · {project.members.length} people · {project.createdByName}</small>
+              {project.canOpen ? null : <small className="late">You’re not on this project</small>}
+            </>
+          );
+          if (!project.canOpen) {
+            return (
+              <button
+                key={project.id}
+                type="button"
+                className="project-card locked"
+                onClick={() => {
+                  setBlocked(project.id);
+                  toast(LOCKED, 'bad');
+                }}
+              >
+                {body}
+              </button>
+            );
+          }
+          return (
+            <Link key={project.id} to={`/projects/${project.id}`} className="project-card">
+              {body}
             </Link>
           );
         })}
@@ -104,7 +130,7 @@ export default function Projects() {
             <Field label="Name"><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></Field>
             <Field label="Description"><textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></Field>
             <div className="fields two">
-              <Field label="Starts"><input type="date" value={form.startDate} onChange={(event) => setForm({ ...form, startDate: event.target.value })} required /></Field>
+              <Field label="Starts" hint="Project window. Each team lead sets that team’s own timeline afterward."><input type="date" value={form.startDate} onChange={(event) => setForm({ ...form, startDate: event.target.value })} required /></Field>
               <Field label="Ends"><input type="date" value={form.endDate} onChange={(event) => setForm({ ...form, endDate: event.target.value })} required /></Field>
             </div>
             <div className="field">

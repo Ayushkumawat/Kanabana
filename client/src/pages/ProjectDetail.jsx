@@ -48,11 +48,7 @@ export default function ProjectDetail() {
   if (error && !project) return <p className="banner">{error}</p>;
   if (!project) return <p className="muted">Loading project…</p>;
 
-  const start = parseISODate(project.startDate).getTime();
-  const end = parseISODate(project.endDate).getTime();
-  const span = Math.max(end - start, 1);
   const today = parseISODate(todayISO()).getTime();
-  const showToday = today >= start && today <= end;
   const departmentIds = new Set(project.departments.map((item) => item.id));
   const memberOptions = people.filter((person) => (
     !project.members.some((member) => member.id === person.id)
@@ -67,6 +63,7 @@ export default function ProjectDetail() {
       const data = await api(`/projects/${project.id}/timeline`, {
         method: 'PATCH',
         body: {
+          departmentId: timeline.departmentId,
           startDate: timeline.startDate,
           endDate: timeline.endDate,
           reason: timeline.reason,
@@ -90,19 +87,6 @@ export default function ProjectDetail() {
           <p className="lede">{project.description}</p>
         </div>
         <div className="actions">
-          {project.canEditTimeline ? (
-            <button
-              type="button"
-              className="btn ghost"
-              onClick={() => setTimeline({
-                startDate: project.startDate,
-                endDate: project.endDate,
-                reason: '',
-              })}
-            >
-              Adjust timeline
-            </button>
-          ) : null}
           {project.canManage ? <button type="button" className="btn ghost" onClick={() => setEditing(true)}>Edit details</button> : null}
           {project.canDelete ? (
             <button
@@ -126,15 +110,54 @@ export default function ProjectDetail() {
         </div>
       </div>
       <span className={`pill ${project.status}`}>{project.status}</span>
-      <div className="timeline" aria-hidden="true">
-        {showToday ? <div className="today-mark" style={{ left: `${((today - start) / span) * 100}%` }} /> : null}
-      </div>
-      <p className="muted">{formatDay(project.startDate)} – {formatDay(project.endDate)}</p>
+      <p className="muted">Project window {formatDay(project.startDate)} – {formatDay(project.endDate)}</p>
+      <section className="panel stack">
+        <h2>Team timelines</h2>
+        {(project.timelines || []).map((item) => {
+          const itemStart = item.startDate ? parseISODate(item.startDate).getTime() : parseISODate(project.startDate).getTime();
+          const itemEnd = item.endDate ? parseISODate(item.endDate).getTime() : parseISODate(project.endDate).getTime();
+          const itemSpan = Math.max(itemEnd - itemStart, 1);
+          const mark = item.startDate && today >= itemStart && today <= itemEnd;
+          return (
+            <article key={item.departmentId} className="team-timeline">
+              <div className="row-between">
+                <strong>{item.departmentName}</strong>
+                {item.canEdit ? (
+                  <button
+                    type="button"
+                    className="btn ghost small"
+                    onClick={() => setTimeline({
+                      departmentId: item.departmentId,
+                      departmentName: item.departmentName,
+                      startDate: item.startDate || project.startDate,
+                      endDate: item.endDate || project.endDate,
+                      reason: '',
+                      pending: item.pending,
+                    })}
+                  >
+                    {item.pending ? 'Set timeline' : 'Adjust timeline'}
+                  </button>
+                ) : null}
+              </div>
+              {item.pending ? (
+                <p className="banner wait">Not set yet. It stays in that team lead’s requests until they set the dates.</p>
+              ) : (
+                <>
+                  <div className="timeline" aria-hidden="true">
+                    {mark ? <div className="today-mark" style={{ left: `${((today - itemStart) / itemSpan) * 100}%` }} /> : null}
+                  </div>
+                  <p className="muted">{formatDay(item.startDate)} – {formatDay(item.endDate)}</p>
+                </>
+              )}
+            </article>
+          );
+        })}
+      </section>
       {!project.canAddTask ? <p className="hint">Ask a team lead or admin to add you before you can put your own work on this project.</p> : (
         <p className="hint">
           {project.canAssign
             ? 'Assign a task to someone on this project. It shows up in their To do. You mark it done after they send it to review.'
-            : 'Your task starts in To do. Move it to In progress, then to Review. Your team lead marks it done. To remove it, ask them and leave a note.'}
+            : 'Your task starts in To do. Move it to In progress, then to Review. Your team lead marks it done. To edit or delete it, ask them and say which one.'}
         </p>
       )}
       <div className="split">
@@ -215,7 +238,11 @@ export default function ProjectDetail() {
                     <strong>{item.actorName}</strong>
                     <small className="muted"> {formatWhen(item.createdAt)}</small>
                     <p>{item.reason}</p>
-                    <p className="muted">{formatDay(item.before.startDate)} – {formatDay(item.before.endDate)} → {formatDay(item.after.startDate)} – {formatDay(item.after.endDate)}</p>
+                    <p className="muted">
+                      {item.departmentName ? `${item.departmentName}: ` : ''}
+                      {item.before.startDate ? `${formatDay(item.before.startDate)} – ${formatDay(item.before.endDate)} → ` : 'Set to '}
+                      {formatDay(item.after.startDate)} – {formatDay(item.after.endDate)}
+                    </p>
                   </article>
                 ))}
               </div>
@@ -271,17 +298,17 @@ export default function ProjectDetail() {
         </Modal>
       ) : null}
       {timeline ? (
-        <Modal title="Adjust timeline" wide onClose={() => { setTimeline(null); setFormError(''); }}>
+        <Modal title={timeline.pending ? `Set ${timeline.departmentName} timeline` : `Adjust ${timeline.departmentName} timeline`} wide onClose={() => { setTimeline(null); setFormError(''); }}>
           <form className="stack" onSubmit={saveTimeline}>
             <div className="fields two">
-              <Field label="Project starts"><input type="date" value={timeline.startDate} onChange={(event) => setTimeline({ ...timeline, startDate: event.target.value })} required /></Field>
-              <Field label="Project ends"><input type="date" value={timeline.endDate} onChange={(event) => setTimeline({ ...timeline, endDate: event.target.value })} required /></Field>
+              <Field label="Team starts"><input type="date" value={timeline.startDate} onChange={(event) => setTimeline({ ...timeline, startDate: event.target.value })} required /></Field>
+              <Field label="Team ends"><input type="date" value={timeline.endDate} onChange={(event) => setTimeline({ ...timeline, endDate: event.target.value })} required /></Field>
             </div>
             <Field
-              label="Reason"
-              hint={user.isAdmin ? 'Optional for an admin. It still stays on the project.' : 'Required. This stays on the project so the other team can see why the dates moved.'}
+              label="Note"
+              hint={timeline.pending || user.isAdmin ? 'Optional. It stays with this timeline.' : 'Required. This stays on the project so the other teams can see why the dates moved.'}
             >
-              <textarea value={timeline.reason} onChange={(event) => setTimeline({ ...timeline, reason: event.target.value })} required={!user.isAdmin} />
+              <textarea value={timeline.reason} onChange={(event) => setTimeline({ ...timeline, reason: event.target.value })} required={!timeline.pending && !user.isAdmin} />
             </Field>
             {formError ? <p className="error">{formError}</p> : null}
             <div className="form-actions">

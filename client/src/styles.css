@@ -284,6 +284,7 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .card-foot { margin-top: 8px; font-size: 12px; color: var(--blue); }
 .card-foot.wait { color: var(--amber); }
 .late { color: var(--terra); font-weight: 700; }
+.ask { color: var(--green-ink); font-weight: 700; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px; }
 
 .week-list, .panel, .project-card {
@@ -417,6 +418,10 @@ textarea { min-height: 88px; resize: vertical; }
 .project-grid, .dept-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
 .project-card { display: grid; gap: 10px; text-decoration: none; color: inherit; }
 .project-card:hover { transform: translateY(-1px); }
+.project-card.locked { border: 0; text-align: left; width: 100%; cursor: not-allowed; }
+.project-card.locked:hover { transform: none; }
+.team-timeline { display: grid; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.team-timeline:last-child { border-bottom: 0; padding-bottom: 0; }
 .progress { height: 6px; background: var(--bg-deep); border-radius: 99px; overflow: hidden; }
 .progress span { display: block; height: 100%; background: var(--green); }
 .timeline { position: relative; min-height: 18px; background: #e7dfd2; border-radius: 999px; }
@@ -447,6 +452,8 @@ textarea { min-height: 88px; resize: vertical; }
 }
 .feed-item { display: grid; gap: 2px; }
 .feed-item small { color: var(--muted); }
+.pick-list { display: grid; gap: 6px; max-height: 220px; overflow: auto; padding: 8px 10px; background: #fff; border: 1px solid var(--line); border-radius: 12px; }
+.pick-list label { display: flex; gap: 8px; align-items: center; }
 .report-form { display: grid; gap: 12px; }
 .report-list { display: grid; }
 .report-card { display: grid; gap: 8px; padding: 14px 0; border-bottom: 1px solid var(--line); }

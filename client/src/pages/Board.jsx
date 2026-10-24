@@ -125,11 +125,13 @@ export default function Board({ scope, personId = '' }) {
 
   async function moveTask(task, status) {
     if (!canMoveTask(user, task, status) || task.status === status) return;
+    setTasks((current) => current.map((item) => (item.id === task.id ? { ...item, status } : item)));
     try {
       await api(`/tasks/${task.id}/status`, { method: 'PATCH', body: { status } });
       if (status === 'review' && !canGovernTask(user, task)) toast('Sent to your team lead for review');
       setTick((value) => value + 1);
     } catch (err) {
+      setTasks((current) => current.map((item) => (item.id === task.id ? task : item)));
       toast(err.message, 'bad');
     }
   }
@@ -194,7 +196,7 @@ export default function Board({ scope, personId = '' }) {
           <select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}>
             <option value="">All work</option>
             <option value="personal">Personal</option>
-            {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+            {projects.filter((project) => project.canOpen).map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
           </select>
           <select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)}>
             <option value="">All priorities</option>

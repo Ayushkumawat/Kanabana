@@ -78,6 +78,8 @@ export default function Kanban({ tasks, user, onOpen, onMove, clashIds }) {
                       {task.fromPreviousWeek ? <span className="late">Last week</span> : null}
                       {task.fromNextWeek ? <span>Later week</span> : null}
                       {task.waitingOn ? <span className="late">Waiting</span> : null}
+                      {task.changeRequests?.includes('edit') ? <span className="ask">Edits requested</span> : null}
+                      {task.changeRequests?.includes('remove') ? <span className="late">Delete requested</span> : null}
                     </div>
                   </article>
                 );
