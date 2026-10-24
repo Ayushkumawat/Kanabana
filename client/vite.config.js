@@ -7,7 +7,7 @@ export default defineConfig(() => ({
   server: {
     host: true,
     port: 5173,
-    allowedHosts: ['kanabana.local'],
+    allowedHosts: true,
     proxy: {
       '/api': 'http://127.0.0.1:4050',
     },

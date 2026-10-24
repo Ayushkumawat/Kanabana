@@ -21,9 +21,11 @@ let officeReady;
 function onOfficeNetwork(hostname) {
   if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname.endsWith('.local')) return true;
   const parts = hostname.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return false;
+  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part) || part > 255)) return false;
   if (parts[0] === 10 || (parts[0] === 192 && parts[1] === 168)) return true;
-  return parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+  // Tailscale addresses are 100.64.0.0/10. The page is already being served from this computer.
+  return parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
 }
 
 export function prepareOffice() {
@@ -33,6 +35,7 @@ export function prepareOffice() {
 
 async function chooseOffice() {
   if (onOfficeNetwork(location.hostname)) return;
+  if (await thisHostServesApi()) return;
   try {
     const response = await fetch(`${LOOPBACK_ORIGIN}/api/health`, { targetAddressSpace: 'loopback' });
     if (response.ok) {
@@ -45,6 +48,15 @@ async function chooseOffice() {
   const path = location.pathname.replace(/^\/Kanabana(?=\/|$)/, '') || '/';
   location.replace(`${OFFICE_APP}${path}${location.search}${location.hash}`);
   await new Promise(() => {});
+}
+
+async function thisHostServesApi() {
+  try {
+    const response = await fetch('/api/health');
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 export async function api(path, { method = 'GET', body } = {}) {

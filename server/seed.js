@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import { addDays, isoDate, parseISODate, startOfWeek, todayISO } from './dates.js';
+import { count, insertOne, now, updateOne } from './store.js';
 
 const admin = 'usr_admin';
 const priya = 'usr_priya';
@@ -20,8 +21,12 @@ const confirm = 'task_confirm';
 const ruleDeploy = 'rule_deploy';
 const ruleQuality = 'rule_quality';
 
-export function seed(db) {
-  const stamp = new Date().toISOString();
+export async function seedIfEmpty() {
+  if (await count('users')) {
+    console.log('Database already has people. Skipping the demo office.');
+    return false;
+  }
+  const stamp = now();
   const earlier = new Date(Date.now() - 86400000).toISOString();
   const adminHash = bcrypt.hashSync('Admin123!', 10);
   const demoHash = bcrypt.hashSync('Demo123!', 10);
@@ -35,118 +40,127 @@ export function seed(db) {
   const lastWed = isoDate(addDays(monday, -5));
   const yesterday = isoDate(addDays(parseISODate(todayISO()), -1));
 
-  const tx = db.transaction(() => {
-    const addUser = db.prepare(`
-      INSERT INTO users (id, name, email, password_hash, role, active, created_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?)
-    `);
-    addUser.run(admin, 'Asha Menon', 'admin@kanabana.local', adminHash, 'admin', stamp);
-    addUser.run(priya, 'Priya Shah', 'priya@kanabana.local', demoHash, 'member', stamp);
-    addUser.run(arun, 'Arun Mehta', 'arun@kanabana.local', demoHash, 'member', stamp);
-    addUser.run(lena, 'Lena Ortiz', 'lena@kanabana.local', demoHash, 'member', stamp);
-    addUser.run(samir, 'Samir Khan', 'samir@kanabana.local', demoHash, 'member', stamp);
+  const addUser = (id, name, email, password, role) => insertOne('users', {
+    id, name, email, password_hash: password, role, active: 1, created_at: stamp, birthday: null, work_anniversary: null,
+  });
+  await addUser(admin, 'Asha Menon', 'admin@kanabana.local', adminHash, 'admin');
+  await addUser(priya, 'Priya Shah', 'priya@kanabana.local', demoHash, 'member');
+  await addUser(arun, 'Arun Mehta', 'arun@kanabana.local', demoHash, 'member');
+  await addUser(lena, 'Lena Ortiz', 'lena@kanabana.local', demoHash, 'member');
+  await addUser(samir, 'Samir Khan', 'samir@kanabana.local', demoHash, 'member');
 
-    const addDept = db.prepare('INSERT INTO departments (id, name, lead_id, created_at) VALUES (?, ?, ?, ?)');
-    addDept.run(fullstack, 'Full-stack', priya, stamp);
-    addDept.run(ai, 'AI', lena, stamp);
+  await insertOne('departments', { id: fullstack, name: 'Full-stack', lead_id: priya, created_at: stamp });
+  await insertOne('departments', { id: ai, name: 'AI', lead_id: lena, created_at: stamp });
+  for (const userId of [admin, priya, arun]) {
+    await insertOne('user_departments', { _id: `${userId}:${fullstack}`, user_id: userId, department_id: fullstack });
+  }
+  for (const userId of [admin, lena, samir]) {
+    await insertOne('user_departments', { _id: `${userId}:${ai}`, user_id: userId, department_id: ai });
+  }
 
-    const link = db.prepare('INSERT INTO user_departments (user_id, department_id) VALUES (?, ?)');
-    for (const userId of [admin, priya, arun]) link.run(userId, fullstack);
-    for (const userId of [admin, lena, samir]) link.run(userId, ai);
+  await insertOne('projects', {
+    id: project,
+    name: 'Client portal refresh',
+    description: 'Replace the portal shell, then connect the summary model. Full-stack and AI share one timeline.',
+    status: 'active',
+    start_date: mon,
+    end_date: launchEnd,
+    created_by: admin,
+    created_at: stamp,
+  });
+  await insertOne('project_departments', { _id: `${project}:${fullstack}`, project_id: project, department_id: fullstack });
+  await insertOne('project_departments', { _id: `${project}:${ai}`, project_id: project, department_id: ai });
+  for (const userId of [priya, arun, lena, samir]) {
+    await insertOne('project_members', { _id: `${project}:${userId}`, project_id: project, user_id: userId });
+  }
 
-    db.prepare(`
-      INSERT INTO projects (id, name, description, status, start_date, end_date, created_by, created_at)
-      VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
-    `).run(
-      project,
-      'Client portal refresh',
-      'Replace the portal shell, then connect the summary model. Full-stack and AI share one timeline.',
-      mon,
-      launchEnd,
-      admin,
-      stamp,
-    );
-
-    const addProjectDept = db.prepare('INSERT INTO project_departments (project_id, department_id) VALUES (?, ?)');
-    addProjectDept.run(project, fullstack);
-    addProjectDept.run(project, ai);
-
-    const addMember = db.prepare('INSERT INTO project_members (project_id, user_id) VALUES (?, ?)');
-    for (const userId of [priya, arun, lena, samir]) addMember.run(project, userId);
-
-    const before = { startDate: mon, endDate: earlierLaunchEnd };
-    const after = { startDate: mon, endDate: launchEnd };
-    db.prepare(`
-      INSERT INTO timeline_changes (id, project_id, actor_id, reason, before_json, after_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      'tlc_seed',
-      project,
-      priya,
-      'Launch moved out two days so the evaluation set can land before release.',
-      JSON.stringify(before),
-      JSON.stringify(after),
-      earlier,
-    );
-
-    const addTask = db.prepare(`
-      INSERT INTO tasks (
-        id, title, description, project_id, stage_id, creator_id, assignee_id,
-        status, priority, due_date, kind, recurring_rule_id, parent_task_id, handoff_task_id,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)
-    `);
-    addTask.run(sketch, 'Sketch the navigation', 'Map the signed-in header, the project list, and the empty state.', project, null, priya, priya, 'done', 'medium', tue, 'project', null, stamp, stamp);
-    addTask.run(nav, 'Build the navigation', 'Turn the sketch into the shared header and side navigation.', project, null, priya, arun, 'upcoming', 'high', fri, 'project', sketch, stamp, stamp);
-    addTask.run(shell, 'Set up the portal shell', 'Stand up the app shell, routing, and the place the model response will land.', project, null, arun, arun, 'in_progress', 'high', fri, 'project', null, stamp, stamp);
-    addTask.run(model, 'Wire the summary model', 'Connect the summary endpoint and show a readable result on the project page.', project, null, arun, samir, 'upcoming', 'high', nextWed, 'project', shell, stamp, stamp);
-    addTask.run(evaluation, 'Draft the evaluation set', 'Collect ten real portal questions and the answer we expect from the model.', project, null, lena, lena, 'upcoming', 'medium', isoDate(addDays(monday, 2)), 'project', null, stamp, stamp);
-    addTask.run(review, 'Review the API contracts', 'Check the routes Arun is exposing before Samir binds the model to them.', project, null, priya, priya, 'in_progress', 'high', yesterday, 'project', null, stamp, stamp);
-    addTask.run(audit, 'Audit the old portal', 'Note which screens people still use before we replace them.', project, null, arun, arun, 'done', 'low', lastWed, 'project', null, earlier, earlier);
-    addTask.run(confirm, 'Confirm department leads for the quarter', 'Check Full-stack and AI still have the right leads.', null, null, admin, admin, 'upcoming', 'medium', fri, 'personal', null, stamp, stamp);
-
-    db.prepare('UPDATE tasks SET handoff_task_id = ? WHERE id = ?').run(nav, sketch);
-    db.prepare('UPDATE tasks SET handoff_task_id = ? WHERE id = ?').run(model, shell);
-
-    const addComment = db.prepare(`
-      INSERT INTO comments (id, task_id, author_id, body, created_at) VALUES (?, ?, ?, ?, ?)
-    `);
-    addComment.run('cmt_shell_note', shell, arun, 'Repo is linked and the base layout is up. Auth screens are still open.', stamp);
-    addComment.run('cmt_shell', shell, priya, 'Leave the model endpoint as a clear handoff point for Samir.', stamp);
-
-    db.prepare(`
-      INSERT INTO recurring_rules (
-        id, title, description, cadence, weekday, priority, assignee_id, created_by, project_id, active, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?)
-    `).run(ruleDeploy, 'Check deploy queue', 'Look through overnight deploys and note anything red.', 'daily', null, 'medium', priya, priya, stamp);
-    db.prepare(`
-      INSERT INTO recurring_rules (
-        id, title, description, cadence, weekday, priority, assignee_id, created_by, project_id, active, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?)
-    `).run(ruleQuality, 'Model quality note', 'Write what the evaluation set caught this week.', 'weekly', 5, 'medium', lena, lena, stamp);
-
-    db.prepare(`
-      INSERT INTO tasks (
-        id, title, description, project_id, stage_id, creator_id, assignee_id,
-        status, priority, due_date, kind, recurring_rule_id, parent_task_id, handoff_task_id,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, NULL, NULL, ?, ?, 'done', 'medium', ?, 'recurring', ?, NULL, NULL, ?, ?)
-    `).run('task_old_deploy', 'Check deploy queue', 'Look through overnight deploys and note anything red.', priya, priya, lastWed, ruleDeploy, earlier, earlier);
-
-    const addNote = db.prepare(`
-      INSERT INTO notifications (id, user_id, message, task_id, project_id, read, created_at)
-      VALUES (?, ?, ?, ?, ?, 0, ?)
-    `);
-    addNote.run('ntf_samir', samir, 'Arun handed you “Wire the summary model” after “Set up the portal shell”.', model, project, stamp);
-    addNote.run('ntf_arun', arun, 'Priya finished “Sketch the navigation”. “Build the navigation” is ready for you.', nav, project, stamp);
-
-    const addEvent = db.prepare(`
-      INSERT INTO activity (id, actor_id, message, task_id, project_id, created_at) VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    addEvent.run('act_office', admin, 'Asha Menon opened the office and added Full-stack and AI.', null, null, earlier);
-    addEvent.run('act_time', priya, 'Priya Shah changed the timeline for Client portal refresh. Launch moved out two days so the evaluation set can land before release.', null, project, earlier);
-    addEvent.run('act_hand', arun, 'Arun Mehta handed “Wire the summary model” to Samir Khan.', model, project, stamp);
+  await insertOne('timeline_changes', {
+    id: 'tlc_seed',
+    project_id: project,
+    actor_id: priya,
+    actor_name: null,
+    reason: 'Launch moved out two days so the evaluation set can land before release.',
+    before_json: JSON.stringify({ startDate: mon, endDate: earlierLaunchEnd }),
+    after_json: JSON.stringify({ startDate: mon, endDate: launchEnd }),
+    created_at: earlier,
   });
 
-  tx();
+  const addTask = (id, title, description, projectId, stageId, creatorId, assigneeId, status, priority, due, kind, parentId, created, updated) => insertOne('tasks', {
+    id,
+    title,
+    description,
+    project_id: projectId,
+    stage_id: stageId,
+    creator_id: creatorId,
+    assignee_id: assigneeId,
+    status,
+    priority,
+    due_date: due,
+    kind,
+    recurring_rule_id: null,
+    parent_task_id: parentId,
+    handoff_task_id: null,
+    created_at: created,
+    updated_at: updated,
+    completed_at: status === 'done' ? updated : null,
+  });
+  await addTask(sketch, 'Sketch the navigation', 'Map the signed-in header, the project list, and the empty state.', project, null, priya, priya, 'done', 'medium', tue, 'project', null, stamp, stamp);
+  await addTask(nav, 'Build the navigation', 'Turn the sketch into the shared header and side navigation.', project, null, priya, arun, 'upcoming', 'high', fri, 'project', sketch, stamp, stamp);
+  await addTask(shell, 'Set up the portal shell', 'Stand up the app shell, routing, and the place the model response will land.', project, null, arun, arun, 'in_progress', 'high', fri, 'project', null, stamp, stamp);
+  await addTask(model, 'Wire the summary model', 'Connect the summary endpoint and show a readable result on the project page.', project, null, arun, samir, 'upcoming', 'high', nextWed, 'project', shell, stamp, stamp);
+  await addTask(evaluation, 'Draft the evaluation set', 'Collect ten real portal questions and the answer we expect from the model.', project, null, lena, lena, 'upcoming', 'medium', isoDate(addDays(monday, 2)), 'project', null, stamp, stamp);
+  await addTask(review, 'Review the API contracts', 'Check the routes Arun is exposing before Samir binds the model to them.', project, null, priya, priya, 'in_progress', 'high', yesterday, 'project', null, stamp, stamp);
+  await addTask(audit, 'Audit the old portal', 'Note which screens people still use before we replace them.', project, null, arun, arun, 'done', 'low', lastWed, 'project', null, earlier, earlier);
+  await addTask(confirm, 'Confirm department leads for the quarter', 'Check Full-stack and AI still have the right leads.', null, null, admin, admin, 'upcoming', 'medium', fri, 'personal', null, stamp, stamp);
+  await updateHandoff(sketch, nav);
+  await updateHandoff(shell, model);
+
+  await insertOne('comments', { id: 'cmt_shell_note', task_id: shell, author_id: arun, author_name: null, body: 'Repo is linked and the base layout is up. Auth screens are still open.', created_at: stamp });
+  await insertOne('comments', { id: 'cmt_shell', task_id: shell, author_id: priya, author_name: null, body: 'Leave the model endpoint as a clear handoff point for Samir.', created_at: stamp });
+
+  await insertOne('recurring_rules', {
+    id: ruleDeploy, title: 'Check deploy queue', description: 'Look through overnight deploys and note anything red.',
+    cadence: 'daily', weekday: null, priority: 'medium', assignee_id: priya, created_by: priya, project_id: null, active: 1, created_at: stamp,
+  });
+  await insertOne('recurring_rules', {
+    id: ruleQuality, title: 'Model quality note', description: 'Write what the evaluation set caught this week.',
+    cadence: 'weekly', weekday: 5, priority: 'medium', assignee_id: lena, created_by: lena, project_id: null, active: 1, created_at: stamp,
+  });
+  await insertOne('tasks', {
+    id: 'task_old_deploy',
+    title: 'Check deploy queue',
+    description: 'Look through overnight deploys and note anything red.',
+    project_id: null,
+    stage_id: null,
+    creator_id: priya,
+    assignee_id: priya,
+    status: 'done',
+    priority: 'medium',
+    due_date: lastWed,
+    kind: 'recurring',
+    recurring_rule_id: ruleDeploy,
+    parent_task_id: null,
+    handoff_task_id: null,
+    created_at: earlier,
+    updated_at: earlier,
+    completed_at: earlier,
+  });
+
+  await insertOne('notifications', {
+    id: 'ntf_samir', user_id: samir, message: 'Arun handed you “Wire the summary model” after “Set up the portal shell”.',
+    task_id: model, project_id: project, read: 0, area: 'board', area_seen: 0, created_at: stamp,
+  });
+  await insertOne('notifications', {
+    id: 'ntf_arun', user_id: arun, message: 'Priya finished “Sketch the navigation”. “Build the navigation” is ready for you.',
+    task_id: nav, project_id: project, read: 0, area: 'board', area_seen: 0, created_at: stamp,
+  });
+  await insertOne('activity', { id: 'act_office', actor_id: admin, message: 'Asha Menon opened the office and added Full-stack and AI.', task_id: null, project_id: null, created_at: earlier });
+  await insertOne('activity', { id: 'act_time', actor_id: priya, message: 'Priya Shah changed the timeline for Client portal refresh. Launch moved out two days so the evaluation set can land before release.', task_id: null, project_id: project, created_at: earlier });
+  await insertOne('activity', { id: 'act_hand', actor_id: arun, message: 'Arun Mehta handed “Wire the summary model” to Samir Khan.', task_id: model, project_id: project, created_at: stamp });
+  console.log('Demo office loaded. Admin login is admin@kanabana.local / Admin123!');
+  return true;
+}
+
+function updateHandoff(taskId, handoffId) {
+  return updateOne('tasks', { _id: taskId }, { handoff_task_id: handoffId });
 }

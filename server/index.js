@@ -6,10 +6,42 @@ import jwt from 'jsonwebtoken';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { addDays, isISODate, isoDate, parseISODate, startOfWeek, todayISO, weekdayMon1 } from './dates.js';
-import { db, ensureRecurring, id, logActivity, notify, now } from './db.js';
+import {
+  aggregate,
+  closeDb,
+  connectDb,
+  count,
+  databaseName,
+  deleteMany,
+  deleteOne,
+  ensureIndexes,
+  ensureRecurring,
+  exists,
+  findMany,
+  findOne,
+  hydrateRules,
+  hydrateTasks,
+  id,
+  insertIgnore,
+  insertOne,
+  loadTask,
+  logActivity,
+  notify,
+  now,
+  ping,
+  prepareWeek,
+  repairData,
+  updateMany,
+  updateOne,
+  usersByIds,
+  withTx,
+} from './db.js';
+import { seedIfEmpty } from './seed.js';
 import { lanAddresses, publishOfficeName } from './office.js';
+import { loadEnv } from './store.js';
 import { registerSections } from './sections.js';
 
+loadEnv();
 const PORT = process.env.PORT || 4050;
 const SECRET = process.env.JWT_SECRET || 'kanabana-dev-secret';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,6 +62,10 @@ app.use((_req, res, next) => {
 });
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '15mb' }));
+
+function wrap(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
 
 function bad(res, status, error) {
   res.status(status).json({ error });
@@ -67,43 +103,65 @@ function uniqueList(value) {
   return [...new Set(Array.isArray(value) ? value.filter(Boolean) : [])];
 }
 
-function shapeUser(row) {
-  const departments = db.prepare(`
-    SELECT d.id, d.name
-    FROM departments d
-    JOIN user_departments ud ON ud.department_id = d.id
-    WHERE ud.user_id = ?
-    ORDER BY d.name
-  `).all(row.id);
-  const leadOf = db.prepare('SELECT id, name FROM departments WHERE lead_id = ? ORDER BY name').all(row.id);
-  return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    role: row.role,
-    active: Boolean(row.active),
-    isAdmin: row.role === 'admin',
-    isLead: leadOf.length > 0,
-    isHr: row.role === 'admin' || departments.some((item) => item.name.toLowerCase() === 'hr'),
-    birthday: row.birthday || null,
-    workAnniversary: row.work_anniversary || null,
-    leadOf,
-    departments,
-    departmentIds: departments.map((item) => item.id),
-    leadDepartmentIds: leadOf.map((item) => item.id),
-    departureLeads: db.prepare(`
-      SELECT DISTINCT u.name
-      FROM departure_requests d
-      JOIN users u ON u.id = d.lead_id
-      WHERE d.user_id = ? AND d.status = 'open'
-      ORDER BY u.name
-    `).all(row.id).map((item) => item.name),
-    createdAt: row.created_at,
-  };
+function byName(left, right) {
+  return String(left.name).localeCompare(String(right.name));
 }
 
-function userContext(userId) {
-  const row = db.prepare('SELECT id, name, email, role, active, birthday, work_anniversary, created_at FROM users WHERE id = ?').get(userId);
+async function shapeUsers(rows) {
+  if (!rows.length) return [];
+  const ids = rows.map((row) => row.id);
+  const [links, departments, departures] = await Promise.all([
+    findMany('user_departments', { user_id: { $in: ids } }),
+    findMany('departments', {}),
+    findMany('departure_requests', { user_id: { $in: ids }, status: 'open' }),
+  ]);
+  const leads = await usersByIds(departures.map((item) => item.lead_id));
+  const deptById = new Map(departments.map((department) => [department.id, department]));
+  return rows.map((row) => {
+    const personDepartments = links
+      .filter((link) => link.user_id === row.id)
+      .map((link) => deptById.get(link.department_id))
+      .filter(Boolean)
+      .sort(byName)
+      .map((department) => ({ id: department.id, name: department.name }));
+    const leadOf = departments
+      .filter((department) => department.lead_id === row.id)
+      .sort(byName)
+      .map((department) => ({ id: department.id, name: department.name }));
+    const departureLeads = [...new Set(
+      departures
+        .filter((item) => item.user_id === row.id)
+        .map((item) => leads.get(item.lead_id)?.name)
+        .filter(Boolean),
+    )].sort((left, right) => left.localeCompare(right));
+    return {
+      id: row.id,
+      name: row.name,
+      email: row.email,
+      role: row.role,
+      active: Boolean(row.active),
+      isAdmin: row.role === 'admin',
+      isLead: leadOf.length > 0,
+      isHr: row.role === 'admin' || personDepartments.some((item) => item.name.toLowerCase() === 'hr'),
+      birthday: row.birthday || null,
+      workAnniversary: row.work_anniversary || null,
+      leadOf,
+      departments: personDepartments,
+      departmentIds: personDepartments.map((item) => item.id),
+      leadDepartmentIds: leadOf.map((item) => item.id),
+      departureLeads,
+      createdAt: row.created_at,
+    };
+  });
+}
+
+async function shapeUser(row) {
+  const [shaped] = await shapeUsers([row]);
+  return shaped;
+}
+
+async function userContext(userId) {
+  const row = await findOne('users', { _id: userId });
   if (!row || !row.active) return null;
   return shapeUser(row);
 }
@@ -112,212 +170,212 @@ function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   if (!token) return bad(res, 401, 'Sign in required');
+  let payload;
   try {
-    const payload = jwt.verify(token, SECRET);
-    const auth = userContext(payload.sub);
-    if (!auth) return bad(res, 401, 'Sign in required');
-    req.auth = auth;
-    next();
+    payload = jwt.verify(token, SECRET);
   } catch {
     return bad(res, 401, 'Sign in required');
   }
+  userContext(payload.sub).then((auth) => {
+    if (!auth) return bad(res, 401, 'Sign in required');
+    req.auth = auth;
+    next();
+  }).catch(next);
 }
 
 function requireAdmin(req, res, next) {
   if (!req.auth.isAdmin) return bad(res, 403, 'Only an admin can do that');
-  else next();
+  next();
 }
 
-function activeUser(userId) {
+async function activeUser(userId) {
   if (!userId) return null;
-  const user = db.prepare('SELECT id, name, active FROM users WHERE id = ?').get(userId);
+  const user = await findOne('users', { _id: userId });
   if (!user || !user.active) return null;
   return user;
 }
 
 function isProjectMember(projectId, userId) {
-  return Boolean(db.prepare('SELECT 1 FROM project_members WHERE project_id = ? AND user_id = ?').get(projectId, userId));
+  return exists('project_members', { project_id: projectId, user_id: userId });
 }
 
-function canViewProject(auth, projectId) {
-  if (auth.isAdmin || isProjectMember(projectId, auth.id)) return true;
-  return Boolean(db.prepare(`
-    SELECT 1 FROM project_departments pd
-    JOIN user_departments ud ON ud.department_id = pd.department_id
-    WHERE pd.project_id = ? AND ud.user_id = ?
-  `).get(projectId, auth.id));
+async function canViewProject(auth, projectId) {
+  if (auth.isAdmin || await isProjectMember(projectId, auth.id)) return true;
+  const projectDepartments = await findMany('project_departments', { project_id: projectId });
+  if (!projectDepartments.length || !auth.departmentIds.length) return false;
+  return exists('user_departments', {
+    user_id: auth.id,
+    department_id: { $in: projectDepartments.map((link) => link.department_id) },
+  });
 }
 
-function userInDepartments(userId, departmentIds) {
-  const marks = departmentIds.map(() => '?').join(',');
-  return Boolean(db.prepare(
-    `SELECT 1 FROM user_departments WHERE user_id = ? AND department_id IN (${marks})`,
-  ).get(userId, ...departmentIds));
+async function userInDepartments(userId, departmentIds) {
+  if (!departmentIds.length) return false;
+  return exists('user_departments', { user_id: userId, department_id: { $in: departmentIds } });
 }
 
-function assigneeInLeadDepts(auth, assigneeId) {
+async function assigneeInLeadDepts(auth, assigneeId) {
   if (!auth.leadDepartmentIds.length) return false;
-  const marks = auth.leadDepartmentIds.map(() => '?').join(',');
-  return Boolean(db.prepare(
-    `SELECT 1 FROM user_departments WHERE user_id = ? AND department_id IN (${marks})`,
-  ).get(assigneeId, ...auth.leadDepartmentIds));
+  return exists('user_departments', { user_id: assigneeId, department_id: { $in: auth.leadDepartmentIds } });
 }
 
-function projectDepartmentIds(projectId) {
-  return db.prepare('SELECT department_id FROM project_departments WHERE project_id = ?').all(projectId).map((item) => item.department_id);
+async function projectDepartmentIds(projectId) {
+  const links = await findMany('project_departments', { project_id: projectId });
+  return links.map((item) => item.department_id);
 }
 
 function managesProject(auth, row) {
   return Boolean(row && (auth.isAdmin || row.created_by === auth.id));
 }
 
-function canDeleteProject(auth, row) {
+async function canDeleteProject(auth, row) {
   if (!row) return false;
   if (auth.isAdmin || row.created_by === auth.id) return true;
-  return projectDepartmentIds(row.id).some((departmentId) => auth.leadDepartmentIds.includes(departmentId));
+  const ids = await projectDepartmentIds(row.id);
+  return ids.some((departmentId) => auth.leadDepartmentIds.includes(departmentId));
 }
 
-function canAssignOnProject(auth, project) {
+async function canAssignOnProject(auth, project) {
   if (!project) return false;
   if (auth.isAdmin || project.created_by === auth.id) return true;
-  return projectDepartmentIds(project.id).some((departmentId) => auth.leadDepartmentIds.includes(departmentId));
+  const ids = await projectDepartmentIds(project.id);
+  return ids.some((departmentId) => auth.leadDepartmentIds.includes(departmentId));
 }
 
-function canGovernTask(auth, task) {
+async function canGovernTask(auth, task) {
   if (!task) return false;
   if (auth.isAdmin) return true;
   if (auth.isLead && task.creator_id === auth.id) return true;
   return assigneeInLeadDepts(auth, task.assignee_id);
 }
 
-function leadIdsFor(userId) {
-  return db.prepare(`
-    SELECT DISTINCT d.lead_id AS id
-    FROM departments d
-    JOIN user_departments ud ON ud.department_id = d.id
-    WHERE ud.user_id = ? AND d.lead_id IS NOT NULL
-  `).all(userId).map((item) => item.id);
+async function leadIdsFor(userId) {
+  const links = await findMany('user_departments', { user_id: userId });
+  if (!links.length) return [];
+  const departments = await findMany('departments', {
+    _id: { $in: links.map((link) => link.department_id) },
+    lead_id: { $ne: null },
+  });
+  return [...new Set(departments.map((department) => department.lead_id))];
 }
 
-function requestRecipients(task) {
-  const ids = new Set(leadIdsFor(task.assignee_id));
-  if (db.prepare('SELECT 1 FROM departments WHERE lead_id = ?').get(task.creator_id)) ids.add(task.creator_id);
+async function requestRecipients(task) {
+  const ids = new Set(await leadIdsFor(task.assignee_id));
+  if (await exists('departments', { lead_id: task.creator_id })) ids.add(task.creator_id);
   ids.delete(task.assignee_id);
   if (!ids.size) {
-    for (const admin of db.prepare(`SELECT id FROM users WHERE role = 'admin' AND active = 1`).all()) ids.add(admin.id);
+    for (const admin of await findMany('users', { role: 'admin', active: 1 })) ids.add(admin.id);
   }
   return [...ids];
 }
 
-function openRequest(task, kind, auth, note) {
-  const existing = db.prepare(`SELECT id FROM task_requests WHERE task_id = ? AND kind = ? AND status = 'open'`).get(task.id, kind);
+async function openRequest(task, kind, auth, note) {
+  const existing = await findOne('task_requests', { task_id: task.id, kind, status: 'open' });
   if (existing) return existing.id;
   const requestId = id('req');
-  db.prepare(`
-    INSERT INTO task_requests (id, task_id, kind, requester_id, note, status, created_at)
-    VALUES (?, ?, ?, ?, ?, 'open', ?)
-  `).run(requestId, task.id, kind, auth.id, note || '', now());
+  await insertOne('task_requests', {
+    id: requestId,
+    task_id: task.id,
+    kind,
+    requester_id: auth.id,
+    note: note || '',
+    response_note: '',
+    status: 'open',
+    created_at: now(),
+  });
   return requestId;
 }
 
-function canHandleRequest(auth, row) {
+async function canHandleRequest(auth, row) {
   if (auth.isAdmin) return true;
   const assigneeId = row.assignee_id || row.assigneeId;
   const creatorId = row.creator_id || row.creatorId;
-  if (assigneeInLeadDepts(auth, assigneeId)) return true;
+  if (await assigneeInLeadDepts(auth, assigneeId)) return true;
   return Boolean(auth.isLead && creatorId === auth.id);
 }
 
-function timelineSnapshot(projectId) {
-  const project = db.prepare('SELECT start_date, end_date FROM projects WHERE id = ?').get(projectId);
+async function timelineSnapshot(projectId) {
+  const project = await findOne('projects', { _id: projectId });
   return { startDate: project.start_date, endDate: project.end_date };
 }
 
-function presentProject(row, auth, withHistory = false) {
-  const departments = db.prepare(`
-    SELECT d.id, d.name FROM departments d
-    JOIN project_departments pd ON pd.department_id = d.id
-    WHERE pd.project_id = ? ORDER BY d.name
-  `).all(row.id);
-  const members = db.prepare(`
-    SELECT u.id, u.name, u.active FROM users u
-    JOIN project_members pm ON pm.user_id = u.id
-    WHERE pm.project_id = ? ORDER BY u.name
-  `).all(row.id).map((member) => ({ ...member, active: Boolean(member.active) }));
-  const counts = db.prepare(`
-    SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done
-    FROM tasks WHERE project_id = ?
-  `).get(row.id);
-  const project = {
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    status: row.status,
-    startDate: row.start_date,
-    endDate: row.end_date,
-    createdAt: row.created_at,
-    departments,
-    members,
-    taskCount: counts.total || 0,
-    doneCount: counts.done || 0,
-    createdBy: row.created_by,
-    createdByName: db.prepare('SELECT name FROM users WHERE id = ?').get(row.created_by)?.name || '',
-    canManage: auth.isAdmin || row.created_by === auth.id,
-    canDelete: auth.isAdmin || row.created_by === auth.id || departments.some((item) => auth.leadDepartmentIds.includes(item.id)),
-    canAssign: auth.isAdmin || row.created_by === auth.id || departments.some((item) => auth.leadDepartmentIds.includes(item.id)),
-    canEditTimeline: auth.isAdmin || departments.some((item) => auth.leadDepartmentIds.includes(item.id)),
-    canAddTask: auth.isAdmin || row.created_by === auth.id || departments.some((item) => auth.leadDepartmentIds.includes(item.id)) || members.some((member) => member.id === auth.id),
-  };
-  if (!withHistory) return project;
-  const history = db.prepare(`
-    SELECT tc.id, tc.reason, tc.before_json, tc.after_json, tc.created_at, COALESCE(NULLIF(tc.actor_name, ''), u.name) AS actor_name
-    FROM timeline_changes tc
-    JOIN users u ON u.id = tc.actor_id
-    WHERE tc.project_id = ?
-    ORDER BY tc.created_at DESC
-  `).all(row.id).map((item) => ({
-    id: item.id,
-    reason: item.reason,
-    before: JSON.parse(item.before_json),
-    after: JSON.parse(item.after_json),
-    createdAt: item.created_at,
-    actorName: item.actor_name,
-  }));
-  return { ...project, history };
+function groupBy(rows, key) {
+  const map = new Map();
+  for (const row of rows) {
+    if (!map.has(row[key])) map.set(row[key], []);
+    map.get(row[key]).push(row);
+  }
+  return map;
 }
 
-const TASK_SQL = `
-SELECT
-  t.id, t.title, t.description, t.project_id, t.creator_id, t.assignee_id,
-  t.status, t.priority, t.due_date, t.kind, t.recurring_rule_id, t.parent_task_id,
-  t.handoff_task_id, t.created_at, t.updated_at, t.completed_at,
-  cu.name AS creator_name,
-  au.name AS assignee_name,
-  p.name AS project_name,
-  parent.title AS parent_title,
-  parent.status AS parent_status,
-  pau.name AS parent_assignee_name,
-  child.title AS handoff_title,
-  child.due_date AS handoff_due_date,
-  child.status AS handoff_status,
-  child.assignee_id AS handoff_assignee_id,
-  cau.name AS handoff_assignee_name,
-  rr.cadence AS cadence,
-  (SELECT group_concat(ud.department_id) FROM user_departments ud WHERE ud.user_id = t.assignee_id) AS assignee_departments,
-  (SELECT group_concat(u.name, ', ') FROM task_dependencies d JOIN users u ON u.id = d.depends_on_id WHERE d.task_id = t.id AND d.status = 'open') AS waiting_on
-FROM tasks t
-JOIN users cu ON cu.id = t.creator_id
-JOIN users au ON au.id = t.assignee_id
-LEFT JOIN projects p ON p.id = t.project_id
-LEFT JOIN tasks parent ON parent.id = t.parent_task_id
-LEFT JOIN users pau ON pau.id = parent.assignee_id
-LEFT JOIN tasks child ON child.id = t.handoff_task_id
-LEFT JOIN users cau ON cau.id = child.assignee_id
-LEFT JOIN recurring_rules rr ON rr.id = t.recurring_rule_id
-`;
+async function presentProjects(rows, auth, withHistory = false) {
+  if (!rows.length) return [];
+  const ids = rows.map((row) => row.id);
+  const [deptLinks, memberLinks, departments, tasks, history] = await Promise.all([
+    findMany('project_departments', { project_id: { $in: ids } }),
+    findMany('project_members', { project_id: { $in: ids } }),
+    findMany('departments', {}),
+    findMany('tasks', { project_id: { $in: ids } }),
+    withHistory ? findMany('timeline_changes', { project_id: { $in: ids } }, { sort: { created_at: -1 } }) : [],
+  ]);
+  const deptMap = new Map(departments.map((department) => [department.id, department]));
+  const userIds = new Set(rows.map((row) => row.created_by));
+  for (const link of memberLinks) userIds.add(link.user_id);
+  for (const item of history) userIds.add(item.actor_id);
+  const users = await usersByIds([...userIds]);
+  const linksByProject = groupBy(deptLinks, 'project_id');
+  const membersByProject = groupBy(memberLinks, 'project_id');
+  const tasksByProject = groupBy(tasks, 'project_id');
+  const historyByProject = groupBy(history, 'project_id');
+  return rows.map((row) => {
+    const projectDepartments = (linksByProject.get(row.id) || [])
+      .map((link) => deptMap.get(link.department_id))
+      .filter(Boolean)
+      .sort(byName)
+      .map((department) => ({ id: department.id, name: department.name }));
+    const members = (membersByProject.get(row.id) || [])
+      .map((link) => users.get(link.user_id))
+      .filter(Boolean)
+      .sort(byName)
+      .map((member) => ({ id: member.id, name: member.name, active: Boolean(member.active) }));
+    const projectTasks = tasksByProject.get(row.id) || [];
+    const onTeam = projectDepartments.some((item) => auth.leadDepartmentIds.includes(item.id));
+    const project = {
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      status: row.status,
+      startDate: row.start_date,
+      endDate: row.end_date,
+      createdAt: row.created_at,
+      departments: projectDepartments,
+      members,
+      taskCount: projectTasks.length,
+      doneCount: projectTasks.filter((task) => task.status === 'done').length,
+      createdBy: row.created_by,
+      createdByName: users.get(row.created_by)?.name || '',
+      canManage: auth.isAdmin || row.created_by === auth.id,
+      canDelete: auth.isAdmin || row.created_by === auth.id || onTeam,
+      canAssign: auth.isAdmin || row.created_by === auth.id || onTeam,
+      canEditTimeline: auth.isAdmin || onTeam,
+      canAddTask: auth.isAdmin || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
+    };
+    if (!withHistory) return project;
+    const items = (historyByProject.get(row.id) || []).map((item) => ({
+      id: item.id,
+      reason: item.reason,
+      before: JSON.parse(item.before_json),
+      after: JSON.parse(item.after_json),
+      createdAt: item.created_at,
+      actorName: String(item.actor_name || '').trim() || users.get(item.actor_id)?.name || '',
+    }));
+    return { ...project, history: items };
+  });
+}
 
-function loadTask(taskId) {
-  return db.prepare(`${TASK_SQL} WHERE t.id = ?`).get(taskId);
+async function presentProject(row, auth, withHistory = false) {
+  const [project] = await presentProjects([row], auth, withHistory);
+  return project;
 }
 
 function mapTask(row, weekEnd, weekStart = null) {
@@ -359,26 +417,24 @@ function mapTask(row, weekEnd, weekStart = null) {
   };
 }
 
-function canSeeTask(auth, task) {
+async function canSeeTask(auth, task) {
   if (!task) return false;
   if (auth.isAdmin || task.assignee_id === auth.id || task.creator_id === auth.id) return true;
-  if (assigneeInLeadDepts(auth, task.assignee_id)) return true;
+  if (await assigneeInLeadDepts(auth, task.assignee_id)) return true;
   if (task.project_id) {
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(task.project_id);
-    if (canAssignOnProject(auth, project)) return true;
+    const project = await findOne('projects', { _id: task.project_id });
+    if (await canAssignOnProject(auth, project)) return true;
   }
-  return Boolean(db.prepare(`
-    SELECT 1 FROM task_dependencies WHERE task_id = ? AND depends_on_id = ? AND status = 'open'
-  `).get(task.id, auth.id));
+  return exists('task_dependencies', { task_id: task.id, depends_on_id: auth.id, status: 'open' });
 }
 
-function taskChain(taskId) {
+async function taskChain(taskId) {
   const upward = [];
   const seenUp = new Set();
-  let cursor = loadTask(taskId);
+  let cursor = await loadTask(taskId);
   let guard = 0;
   while (cursor?.parent_task_id && guard < 8) {
-    const parent = loadTask(cursor.parent_task_id);
+    const parent = await loadTask(cursor.parent_task_id);
     if (!parent || seenUp.has(parent.id)) break;
     seenUp.add(parent.id);
     upward.push(parent);
@@ -388,17 +444,17 @@ function taskChain(taskId) {
   upward.reverse();
   const downward = [];
   const seenDown = new Set();
-  cursor = loadTask(taskId);
+  cursor = await loadTask(taskId);
   guard = 0;
   while (cursor?.handoff_task_id && guard < 8) {
-    const child = loadTask(cursor.handoff_task_id);
+    const child = await loadTask(cursor.handoff_task_id);
     if (!child || seenDown.has(child.id)) break;
     seenDown.add(child.id);
     downward.push(child);
     cursor = child;
     guard += 1;
   }
-  const rows = [...upward, loadTask(taskId), ...downward].filter(Boolean);
+  const rows = [...upward, await loadTask(taskId), ...downward].filter(Boolean);
   const unique = [];
   const ids = new Set();
   for (const row of rows) {
@@ -409,38 +465,33 @@ function taskChain(taskId) {
   return unique;
 }
 
-function insertTaskRow(fields) {
+async function insertTaskRow(fields) {
   const taskId = fields.id || id('task');
   const stamp = now();
-  db.prepare(`
-    INSERT INTO tasks (
-      id, title, description, project_id, stage_id, creator_id, assignee_id,
-      status, priority, due_date, kind, recurring_rule_id, parent_task_id, handoff_task_id,
-      created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    taskId,
-    fields.title,
-    fields.description || '',
-    fields.projectId || null,
-    null,
-    fields.creatorId,
-    fields.assigneeId,
-    fields.status,
-    fields.priority,
-    fields.dueDate,
-    fields.kind,
-    fields.recurringRuleId || null,
-    fields.parentTaskId || null,
-    fields.handoffTaskId || null,
-    stamp,
-    stamp,
-  );
+  await insertOne('tasks', {
+    id: taskId,
+    title: fields.title,
+    description: fields.description || '',
+    project_id: fields.projectId || null,
+    stage_id: null,
+    creator_id: fields.creatorId,
+    assignee_id: fields.assigneeId,
+    status: fields.status,
+    priority: fields.priority,
+    due_date: fields.dueDate,
+    kind: fields.kind,
+    recurring_rule_id: fields.recurringRuleId || null,
+    parent_task_id: fields.parentTaskId || null,
+    handoff_task_id: fields.handoffTaskId || null,
+    created_at: stamp,
+    updated_at: stamp,
+    completed_at: null,
+  });
   return taskId;
 }
 
-function createHandoff(parentId, auth, handoff) {
-  const parent = db.prepare('SELECT * FROM tasks WHERE id = ?').get(parentId);
+async function createHandoff(parentId, auth, handoff) {
+  const parent = await findOne('tasks', { _id: parentId });
   if (!parent) throw httpError(404, 'Task not found');
   if (parent.handoff_task_id) {
     throw httpError(400, 'This task already names the next person. Only an admin can change that.');
@@ -453,13 +504,13 @@ function createHandoff(parentId, auth, handoff) {
   if (handoff.dueDate < parent.due_date) {
     throw httpError(400, 'The next due date should be on or after this task’s due date');
   }
-  const next = activeUser(handoff.assigneeId);
+  const next = await activeUser(handoff.assigneeId);
   if (!next) throw httpError(400, 'Choose an active person for the next step');
   if (next.id === parent.assignee_id) throw httpError(400, 'Hand the work to someone else');
-  if (parent.project_id && !isProjectMember(parent.project_id, next.id)) {
+  if (parent.project_id && !await isProjectMember(parent.project_id, next.id)) {
     throw httpError(400, 'The next person needs to be on this project');
   }
-  const childId = insertTaskRow({
+  const childId = await insertTaskRow({
     title: title.value,
     description: description.value,
     projectId: parent.project_id,
@@ -471,43 +522,43 @@ function createHandoff(parentId, auth, handoff) {
     kind: parent.project_id ? 'project' : 'personal',
     parentTaskId: parent.id,
   });
-  db.prepare('UPDATE tasks SET handoff_task_id = ?, updated_at = ? WHERE id = ?').run(childId, now(), parent.id);
+  await updateOne('tasks', { _id: parent.id }, { handoff_task_id: childId, updated_at: now() });
   if (next.id !== auth.id) {
-    notify(next.id, `${auth.name} handed you “${title.value}” after “${parent.title}”.`, childId, parent.project_id);
+    await notify(next.id, `${auth.name} handed you “${title.value}” after “${parent.title}”.`, childId, parent.project_id);
   }
-  logActivity(auth.id, `${auth.name} handed “${title.value}” to ${next.name}.`, childId, parent.project_id);
+  await logActivity(auth.id, `${auth.name} handed “${title.value}” to ${next.name}.`, childId, parent.project_id);
   return childId;
 }
 
-function writeStatus(taskId, status, previousCompletedAt) {
+async function writeStatus(taskId, status, previousCompletedAt) {
   const stamp = now();
   const completedAt = status === 'done' ? (previousCompletedAt || stamp) : null;
-  db.prepare('UPDATE tasks SET status = ?, completed_at = ?, updated_at = ? WHERE id = ?').run(status, completedAt, stamp, taskId);
+  await updateOne('tasks', { _id: taskId }, { status, completed_at: completedAt, updated_at: stamp });
 }
 
-function noteStatus(task, status, auth) {
-  logActivity(auth.id, `${auth.name} moved “${task.title}” to ${STATUS_LABEL[status]}.`, task.id, task.project_id);
+async function noteStatus(task, status, auth) {
+  await logActivity(auth.id, `${auth.name} moved “${task.title}” to ${STATUS_LABEL[status]}.`, task.id, task.project_id);
   if (task.status === 'review' && status !== 'review') {
-    db.prepare(`UPDATE task_requests SET status = ? WHERE task_id = ? AND kind = 'review' AND status = 'open'`).run(status === 'done' ? 'accepted' : 'declined', task.id);
+    await updateMany('task_requests', { task_id: task.id, kind: 'review', status: 'open' }, { status: status === 'done' ? 'accepted' : 'declined' });
   }
-  if (status === 'review' && auth.id === task.assignee_id && !canGovernTask(auth, task)) {
-    openRequest(task, 'review', auth, '');
-    for (const userId of requestRecipients(task)) {
-      notify(userId, `${auth.name} asked you to review “${task.title}”.`, task.id, task.project_id, 'requests');
+  if (status === 'review' && auth.id === task.assignee_id && !await canGovernTask(auth, task)) {
+    await openRequest(task, 'review', auth, '');
+    for (const userId of await requestRecipients(task)) {
+      await notify(userId, `${auth.name} asked you to review “${task.title}”.`, task.id, task.project_id, 'requests');
     }
   }
   if (status !== 'done' || !task.handoff_task_id) return;
-  const child = db.prepare('SELECT id, title, assignee_id FROM tasks WHERE id = ?').get(task.handoff_task_id);
+  const child = await findOne('tasks', { _id: task.handoff_task_id });
   if (child && child.assignee_id !== auth.id) {
-    notify(child.assignee_id, `${auth.name} finished “${task.title}”. “${child.title}” is ready for you.`, child.id, task.project_id);
+    await notify(child.assignee_id, `${auth.name} finished “${task.title}”. “${child.title}” is ready for you.`, child.id, task.project_id);
   }
 }
 
-function rawTask(taskId) {
-  return db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+async function rawTask(taskId) {
+  return findOne('tasks', { _id: taskId });
 }
 
-function canTouchRule(auth, rule) {
+async function canTouchRule(auth, rule) {
   if (auth.isAdmin || rule.created_by === auth.id || rule.assignee_id === auth.id) return true;
   return assigneeInLeadDepts(auth, rule.assignee_id);
 }
@@ -531,65 +582,95 @@ function mapRule(row) {
   };
 }
 
-function refreshRecurring() {
-  const monday = startOfWeek(new Date());
-  ensureRecurring(isoDate(monday), isoDate(addDays(monday, 13)));
-}
-
-function notifyProject(projectId, auth, message) {
-  const recipients = new Set(
-    db.prepare('SELECT user_id FROM project_members WHERE project_id = ?').all(projectId).map((row) => row.user_id),
-  );
-  const leads = db.prepare(`
-    SELECT d.lead_id FROM departments d
-    JOIN project_departments pd ON pd.department_id = d.id
-    WHERE pd.project_id = ?
-  `).all(projectId);
-  for (const lead of leads) if (lead.lead_id) recipients.add(lead.lead_id);
+async function notifyProject(projectId, auth, message) {
+  const recipients = new Set((await findMany('project_members', { project_id: projectId })).map((row) => row.user_id));
+  const links = await findMany('project_departments', { project_id: projectId });
+  if (links.length) {
+    const departments = await findMany('departments', { _id: { $in: links.map((link) => link.department_id) } });
+    for (const department of departments) if (department.lead_id) recipients.add(department.lead_id);
+  }
   for (const userId of recipients) {
-    if (userId !== auth.id) notify(userId, message, null, projectId);
+    if (userId !== auth.id) await notify(userId, message, null, projectId);
   }
 }
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
-});
+async function deleteTask(taskId) {
+  await updateMany('tasks', { handoff_task_id: taskId }, { handoff_task_id: null, updated_at: now() });
+  await updateMany('tasks', { parent_task_id: taskId }, { parent_task_id: null });
+  await deleteMany('comments', { task_id: taskId });
+  await deleteMany('task_requests', { task_id: taskId });
+  await deleteMany('departure_items', { task_id: taskId });
+  await deleteMany('task_dependencies', { task_id: taskId });
+  await updateMany('knowledge_items', { task_id: taskId }, { task_id: null });
+  await deleteOne('tasks', { _id: taskId });
+}
 
-app.post('/api/login', (req, res) => {
+async function removeProject(projectId) {
+  const tasks = await findMany('tasks', { project_id: projectId });
+  const taskIds = tasks.map((task) => task.id);
+  if (taskIds.length) {
+    await updateMany('tasks', { handoff_task_id: { $in: taskIds } }, { handoff_task_id: null, updated_at: now() });
+    for (const taskId of taskIds) await deleteTask(taskId);
+  }
+  const rules = await findMany('recurring_rules', { project_id: projectId });
+  for (const rule of rules) {
+    await updateMany('tasks', { recurring_rule_id: rule.id }, { recurring_rule_id: null });
+    await deleteMany('departure_items', { rule_id: rule.id });
+    await deleteOne('recurring_rules', { _id: rule.id });
+  }
+  await deleteMany('project_departments', { project_id: projectId });
+  await deleteMany('project_members', { project_id: projectId });
+  await deleteMany('project_stages', { project_id: projectId });
+  await deleteMany('timeline_changes', { project_id: projectId });
+  await deleteMany('knowledge_items', { project_id: projectId });
+  await deleteOne('projects', { _id: projectId });
+}
+
+app.get('/api/health', wrap(async (_req, res) => {
+  try {
+    await ping();
+    res.json({ ok: true });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+}));
+
+app.post('/api/login', wrap(async (req, res) => {
   const email = readEmail(req.body.email || '');
   const password = String(req.body.password || '');
   if (email.error) return bad(res, 401, 'Email or password is incorrect');
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.value);
+  const user = await findOne('users', { email: email.value });
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return bad(res, 401, 'Email or password is incorrect');
   }
   if (!user.active) return bad(res, 403, 'This account is deactivated. Ask an admin to turn it back on.');
   const token = jwt.sign({ sub: user.id }, SECRET, { expiresIn: '7d' });
-  res.json({ token, user: userContext(user.id) });
-});
+  res.json({ token, user: await userContext(user.id) });
+}));
 
-app.get('/api/me', requireAuth, (req, res) => {
+app.get('/api/me', requireAuth, wrap(async (req, res) => {
   res.json({ user: req.auth });
-});
+}));
 
-app.post('/api/me/password', requireAuth, (req, res) => {
+app.post('/api/me/password', requireAuth, wrap(async (req, res) => {
   const next = readPassword(req.body.nextPassword);
   if (next.error) return bad(res, 400, next.error);
-  const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.auth.id);
+  const user = await findOne('users', { _id: req.auth.id });
   if (!bcrypt.compareSync(String(req.body.currentPassword || ''), user.password_hash)) {
     return bad(res, 400, 'Current password is incorrect');
   }
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(next.value, 10), req.auth.id);
-  logActivity(req.auth.id, `${req.auth.name} changed their password.`);
+  await updateOne('users', { _id: req.auth.id }, { password_hash: bcrypt.hashSync(next.value, 10) });
+  await logActivity(req.auth.id, `${req.auth.name} changed their password.`);
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/users', requireAuth, (_req, res) => {
-  const users = db.prepare('SELECT id, name, email, role, active, birthday, work_anniversary, created_at FROM users ORDER BY name').all().map(shapeUser);
-  res.json({ users });
-});
+app.get('/api/users', requireAuth, wrap(async (_req, res) => {
+  const rows = await findMany('users', {});
+  rows.sort(byName);
+  res.json({ users: await shapeUsers(rows) });
+}));
 
-app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/users', requireAuth, requireAdmin, wrap(async (req, res) => {
   const name = readText(req.body.name, 80, 'the person’s name', true);
   if (name.error) return bad(res, 400, name.error);
   const email = readEmail(req.body.email);
@@ -599,38 +680,43 @@ app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
   const departmentIds = uniqueList(req.body.departmentIds);
   const leadDepartmentId = req.body.leadDepartmentId || null;
   if (!departmentIds.length) return bad(res, 400, 'Choose at least one department');
-  const marks = departmentIds.map(() => '?').join(',');
-  const found = db.prepare(`SELECT id FROM departments WHERE id IN (${marks})`).all(...departmentIds);
+  const found = await findMany('departments', { _id: { $in: departmentIds } });
   if (found.length !== departmentIds.length) return bad(res, 400, 'Choose a real department');
   if (leadDepartmentId && !departmentIds.includes(leadDepartmentId)) {
     return bad(res, 400, 'A team lead has to belong to that department');
   }
-  if (db.prepare('SELECT 1 FROM users WHERE email = ?').get(email.value)) {
-    return bad(res, 400, 'That email is already in use');
-  }
+  if (await exists('users', { email: email.value })) return bad(res, 400, 'That email is already in use');
   if (!isISODate(req.body.birthday)) return bad(res, 400, 'Choose a birthday');
   if (!isISODate(req.body.workAnniversary)) return bad(res, 400, 'Choose a work anniversary');
   const userId = id('usr');
   try {
-    db.transaction(() => {
-      db.prepare(`
-        INSERT INTO users (id, name, email, password_hash, role, active, birthday, work_anniversary, created_at)
-        VALUES (?, ?, ?, ?, 'member', 1, ?, ?, ?)
-      `).run(userId, name.value, email.value, bcrypt.hashSync(password.value, 10), req.body.birthday, req.body.workAnniversary, now());
-      const link = db.prepare('INSERT INTO user_departments (user_id, department_id) VALUES (?, ?)');
-      for (const departmentId of departmentIds) link.run(userId, departmentId);
-      if (leadDepartmentId) db.prepare('UPDATE departments SET lead_id = ? WHERE id = ?').run(userId, leadDepartmentId);
-      logActivity(req.auth.id, `${req.auth.name} added ${name.value} to the office.`);
-    })();
+    await withTx(async () => {
+      await insertOne('users', {
+        id: userId,
+        name: name.value,
+        email: email.value,
+        password_hash: bcrypt.hashSync(password.value, 10),
+        role: 'member',
+        active: 1,
+        birthday: req.body.birthday,
+        work_anniversary: req.body.workAnniversary,
+        created_at: now(),
+      });
+      for (const departmentId of departmentIds) {
+        await insertOne('user_departments', { _id: `${userId}:${departmentId}`, user_id: userId, department_id: departmentId });
+      }
+      if (leadDepartmentId) await updateOne('departments', { _id: leadDepartmentId }, { lead_id: userId });
+      await logActivity(req.auth.id, `${req.auth.name} added ${name.value} to the office.`);
+    });
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) return bad(res, 400, 'That email is already in use');
     throw error;
   }
-  res.status(201).json({ user: userContext(userId) });
-});
+  res.status(201).json({ user: await userContext(userId) });
+}));
 
-app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
-  const current = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+app.patch('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
+  const current = await findOne('users', { _id: req.params.id });
   if (!current) return bad(res, 404, 'Person not found');
   const name = readText(req.body.name, 80, 'the person’s name', true);
   if (name.error) return bad(res, 400, name.error);
@@ -639,13 +725,12 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
   const departmentIds = uniqueList(req.body.departmentIds);
   const active = req.body.active !== false;
   if (!departmentIds.length) return bad(res, 400, 'Each person needs at least one department');
-  const marks = departmentIds.map(() => '?').join(',');
-  const found = db.prepare(`SELECT id FROM departments WHERE id IN (${marks})`).all(...departmentIds);
+  const found = await findMany('departments', { _id: { $in: departmentIds } });
   if (found.length !== departmentIds.length) return bad(res, 400, 'Choose a real department');
-  if (db.prepare('SELECT 1 FROM users WHERE email = ? AND id != ?').get(email.value, current.id)) {
+  if (await exists('users', { email: email.value, _id: { $ne: current.id } })) {
     return bad(res, 400, 'That email is already in use');
   }
-  const leading = db.prepare('SELECT id, name FROM departments WHERE lead_id = ?').all(current.id);
+  const leading = (await findMany('departments', { lead_id: current.id })).sort(byName);
   for (const department of leading) {
     if (!departmentIds.includes(department.id)) {
       return bad(res, 400, `${current.name} still leads ${department.name}. Choose a new lead before removing them.`);
@@ -655,32 +740,39 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     if (current.id === req.auth.id) return bad(res, 400, 'You can’t deactivate your own account');
     if (leading.length) return bad(res, 400, `Choose a new lead for ${leading.map((item) => item.name).join(', ')} first`);
     if (current.role === 'admin') {
-      const others = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = 1 AND id != ?`).get(current.id).n;
+      const others = await count('users', { role: 'admin', active: 1, _id: { $ne: current.id } });
       if (!others) return bad(res, 400, 'Keep at least one active admin');
     }
   }
   const birthday = isISODate(req.body.birthday) ? req.body.birthday : (current.birthday || null);
   const workAnniversary = isISODate(req.body.workAnniversary) ? req.body.workAnniversary : (current.work_anniversary || null);
-  db.transaction(() => {
-    db.prepare('UPDATE users SET name = ?, email = ?, active = ?, birthday = ?, work_anniversary = ? WHERE id = ?').run(name.value, email.value, active ? 1 : 0, birthday, workAnniversary, current.id);
-    db.prepare('DELETE FROM user_departments WHERE user_id = ?').run(current.id);
-    const link = db.prepare('INSERT INTO user_departments (user_id, department_id) VALUES (?, ?)');
-    for (const departmentId of departmentIds) link.run(current.id, departmentId);
-    logActivity(req.auth.id, `${req.auth.name} updated ${name.value}.`);
-  })();
-  const row = db.prepare('SELECT id, name, email, role, active, birthday, work_anniversary, created_at FROM users WHERE id = ?').get(current.id);
-  res.json({ user: shapeUser(row) });
-});
+  await withTx(async () => {
+    await updateOne('users', { _id: current.id }, {
+      name: name.value,
+      email: email.value,
+      active: active ? 1 : 0,
+      birthday,
+      work_anniversary: workAnniversary,
+    });
+    await deleteMany('user_departments', { user_id: current.id });
+    for (const departmentId of departmentIds) {
+      await insertOne('user_departments', { _id: `${current.id}:${departmentId}`, user_id: current.id, department_id: departmentId });
+    }
+    await logActivity(req.auth.id, `${req.auth.name} updated ${name.value}.`);
+  });
+  const row = await findOne('users', { _id: current.id });
+  res.json({ user: await shapeUser(row) });
+}));
 
-app.post('/api/users/:id/password', requireAuth, requireAdmin, (req, res) => {
-  const person = db.prepare('SELECT id, name FROM users WHERE id = ?').get(req.params.id);
+app.post('/api/users/:id/password', requireAuth, requireAdmin, wrap(async (req, res) => {
+  const person = await findOne('users', { _id: req.params.id });
   if (!person) return bad(res, 404, 'Person not found');
   const password = readPassword(req.body.password);
   if (password.error) return bad(res, 400, password.error);
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(password.value, 10), person.id);
-  logActivity(req.auth.id, `${req.auth.name} reset the password for ${person.name}.`);
+  await updateOne('users', { _id: person.id }, { password_hash: bcrypt.hashSync(password.value, 10) });
+  await logActivity(req.auth.id, `${req.auth.name} reset the password for ${person.name}.`);
   res.json({ ok: true });
-});
+}));
 
 function nameList(names) {
   if (names.length <= 1) return names[0] || '';
@@ -688,52 +780,54 @@ function nameList(names) {
   return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`;
 }
 
-function personDepartments(userId) {
-  return db.prepare(`
-    SELECT d.id, d.name, d.lead_id AS leadId, u.name AS leadName, u.active AS leadActive
-    FROM departments d
-    JOIN user_departments ud ON ud.department_id = d.id
-    LEFT JOIN users u ON u.id = d.lead_id
-    WHERE ud.user_id = ?
-    ORDER BY d.name
-  `).all(userId);
+async function personDepartments(userId) {
+  const links = await findMany('user_departments', { user_id: userId });
+  if (!links.length) return [];
+  const departments = await findMany('departments', { _id: { $in: links.map((link) => link.department_id) } });
+  const leads = await usersByIds(departments.map((department) => department.lead_id));
+  return departments.map((department) => {
+    const lead = department.lead_id ? leads.get(department.lead_id) : null;
+    return {
+      id: department.id,
+      name: department.name,
+      leadId: department.lead_id || null,
+      leadName: lead?.name || null,
+      leadActive: lead ? lead.active : null,
+    };
+  }).sort(byName);
 }
 
-function owningDepartmentIds(projectId, departmentIds) {
+function owningDepartmentIds(projectId, departmentIds, projectDepartmentSet) {
   if (!projectId) return departmentIds.slice();
-  const overlap = departmentIds.filter((departmentId) => projectDepartmentIds(projectId).includes(departmentId));
+  const overlap = departmentIds.filter((departmentId) => projectDepartmentSet.has(departmentId));
   return overlap.length ? overlap : departmentIds.slice();
 }
 
-function teammates(departmentIds, exceptId) {
+async function teammates(departmentIds, exceptId) {
   if (!departmentIds.length) return [];
-  const marks = departmentIds.map(() => '?').join(',');
-  return db.prepare(`
-    SELECT DISTINCT u.id, u.name
-    FROM users u
-    JOIN user_departments ud ON ud.user_id = u.id
-    WHERE ud.department_id IN (${marks}) AND u.active = 1 AND u.id != ?
-    ORDER BY u.name
-  `).all(...departmentIds, exceptId);
+  const links = await findMany('user_departments', { department_id: { $in: departmentIds } });
+  const ids = [...new Set(links.map((link) => link.user_id))].filter((userId) => userId !== exceptId);
+  if (!ids.length) return [];
+  const users = await findMany('users', { _id: { $in: ids }, active: 1 });
+  return users.map((user) => ({ id: user.id, name: user.name })).sort(byName);
 }
 
-function departureBuckets(personId) {
-  const departments = personDepartments(personId);
+async function departureBuckets(personId) {
+  const departments = await personDepartments(personId);
   const departmentIds = departments.map((item) => item.id);
-  const tasks = db.prepare(`
-    SELECT t.id, t.title, t.status, t.project_id, p.name AS project_name
-    FROM tasks t
-    LEFT JOIN projects p ON p.id = t.project_id
-    WHERE t.assignee_id = ? AND t.status != 'done' AND t.recurring_rule_id IS NULL
-    ORDER BY t.due_date, t.title
-  `).all(personId);
-  const rules = db.prepare(`
-    SELECT r.id, r.title, r.project_id, p.name AS project_name
-    FROM recurring_rules r
-    LEFT JOIN projects p ON p.id = r.project_id
-    WHERE r.assignee_id = ?
-    ORDER BY r.title
-  `).all(personId);
+  const projectIds = new Set();
+  const tasks = (await findMany('tasks', {
+    assignee_id: personId,
+    status: { $ne: 'done' },
+    recurring_rule_id: null,
+  })).sort((left, right) => left.due_date.localeCompare(right.due_date) || left.title.localeCompare(right.title));
+  const rules = (await findMany('recurring_rules', { assignee_id: personId })).sort((left, right) => left.title.localeCompare(right.title));
+  for (const item of [...tasks, ...rules]) if (item.project_id) projectIds.add(item.project_id);
+  const projectLinks = projectIds.size
+    ? await findMany('project_departments', { project_id: { $in: [...projectIds] } })
+    : [];
+  const departmentsByProject = groupBy(projectLinks, 'project_id');
+  const projectNames = new Map((projectIds.size ? await findMany('projects', { _id: { $in: [...projectIds] } }) : []).map((project) => [project.id, project.name]));
   const buckets = new Map();
   for (const department of departments) {
     if (!department.leadId || department.leadId === personId) continue;
@@ -752,13 +846,21 @@ function departureBuckets(personId) {
     bucket.departmentNames.push(department.name);
   }
   function place(item, key) {
-    const owners = owningDepartmentIds(item.project_id, departmentIds);
-    const leadIds = [...new Set(owners.map((id) => departments.find((department) => department.id === id)?.leadId).filter((id) => id && id !== personId))];
+    const owned = new Set((departmentsByProject.get(item.project_id) || []).map((link) => link.department_id));
+    const owners = owningDepartmentIds(item.project_id, departmentIds, owned);
+    const leadIds = [...new Set(owners.map((departmentId) => departments.find((department) => department.id === departmentId)?.leadId).filter((leadId) => leadId && leadId !== personId))];
     for (const leadId of leadIds) {
       const bucket = buckets.get(leadId);
       if (!bucket || bucket[key].some((row) => row.id === item.id)) continue;
-      const scoped = owners.filter((id) => bucket.departmentIds.includes(id));
-      bucket[key].push({ ...item, departmentIds: scoped.length ? scoped : bucket.departmentIds });
+      const scoped = owners.filter((departmentId) => bucket.departmentIds.includes(departmentId));
+      bucket[key].push({
+        id: item.id,
+        title: item.title,
+        status: item.status,
+        project_id: item.project_id,
+        project_name: item.project_id ? (projectNames.get(item.project_id) || null) : null,
+        departmentIds: scoped.length ? scoped : bucket.departmentIds,
+      });
     }
   }
   for (const task of tasks) place(task, 'tasks');
@@ -766,114 +868,132 @@ function departureBuckets(personId) {
   return { departments, buckets: [...buckets.values()] };
 }
 
-function eraseUser(person, requestedById, actor) {
-  const created = db.prepare('SELECT COUNT(*) AS n FROM projects WHERE created_by = ?').get(person.id).n;
+async function eraseUser(person, requestedById) {
+  const created = await count('projects', { created_by: person.id });
   if (created) throw httpError(400, `${person.name} created projects that are still here, so this account can’t be deleted.`);
-  const leading = db.prepare('SELECT name FROM departments WHERE lead_id = ? ORDER BY name').all(person.id);
+  const leading = (await findMany('departments', { lead_id: person.id })).sort(byName);
   if (leading.length) {
     throw httpError(400, `${person.name} still leads ${leading.map((item) => item.name).join(', ')}. Choose a new lead first.`);
   }
-  const openTasks = db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE assignee_id = ? AND status != 'done'`).get(person.id).n;
-  const rules = db.prepare('SELECT COUNT(*) AS n FROM recurring_rules WHERE assignee_id = ?').get(person.id).n;
+  const openTasks = await count('tasks', { assignee_id: person.id, status: { $ne: 'done' } });
+  const rules = await count('recurring_rules', { assignee_id: person.id });
   if (openTasks || rules) throw httpError(400, `${person.name} still has tasks to move.`);
-  db.transaction(() => {
-  db.prepare(`UPDATE tasks SET assignee_id = ?, updated_at = ? WHERE assignee_id = ? AND status = 'done'`).run(requestedById, now(), person.id);
-  db.prepare('UPDATE tasks SET creator_id = ? WHERE creator_id = ?').run(requestedById, person.id);
-  db.prepare('UPDATE recurring_rules SET created_by = ? WHERE created_by = ?').run(requestedById, person.id);
-  db.prepare(`UPDATE comments SET author_name = ? WHERE author_id = ? AND (author_name IS NULL OR author_name = '')`).run(person.name, person.id);
-  db.prepare('UPDATE comments SET author_id = ? WHERE author_id = ?').run(requestedById, person.id);
-  db.prepare(`UPDATE timeline_changes SET actor_name = ? WHERE actor_id = ? AND (actor_name IS NULL OR actor_name = '')`).run(person.name, person.id);
-  db.prepare('UPDATE timeline_changes SET actor_id = ? WHERE actor_id = ?').run(requestedById, person.id);
-  db.prepare('UPDATE task_requests SET requester_id = ? WHERE requester_id = ?').run(requestedById, person.id);
-  db.prepare('UPDATE office_chores SET requester_id = ? WHERE requester_id = ?').run(requestedById, person.id);
-  db.prepare('DELETE FROM attendance WHERE user_id = ?').run(person.id);
-  db.prepare('DELETE FROM notifications WHERE user_id = ?').run(person.id);
-  db.prepare('DELETE FROM activity WHERE actor_id = ?').run(person.id);
-  db.prepare('DELETE FROM project_members WHERE user_id = ?').run(person.id);
-  db.prepare('DELETE FROM departure_items WHERE request_id IN (SELECT id FROM departure_requests WHERE user_id = ?)').run(person.id);
-  db.prepare('DELETE FROM departure_requests WHERE user_id = ?').run(person.id);
-  db.prepare('DELETE FROM departure_holds WHERE user_id = ?').run(person.id);
-  db.prepare('DELETE FROM task_dependencies WHERE requester_id = ? OR depends_on_id = ?').run(person.id, person.id);
-  db.prepare('UPDATE tenders SET created_by = ? WHERE created_by = ?').run(requestedById, person.id);
-  db.prepare('UPDATE hiring_positions SET created_by = ? WHERE created_by = ?').run(requestedById, person.id);
-  db.prepare('UPDATE hiring_resumes SET uploaded_by = ? WHERE uploaded_by = ?').run(requestedById, person.id);
-  db.prepare('UPDATE hiring_resumes SET reviewer_id = NULL WHERE reviewer_id = ?').run(person.id);
-  db.prepare('DELETE FROM user_departments WHERE user_id = ?').run(person.id);
-  db.prepare('DELETE FROM users WHERE id = ?').run(person.id);
-  const keeper = db.prepare('SELECT id, name FROM users WHERE id = ?').get(requestedById);
-  if (keeper) logActivity(keeper.id, `${keeper.name} removed ${person.name} from the office.`);
-  })();
+  await withTx(async () => {
+    const stamp = now();
+    await updateMany('tasks', { assignee_id: person.id, status: 'done' }, { assignee_id: requestedById, updated_at: stamp });
+    await updateMany('tasks', { creator_id: person.id }, { creator_id: requestedById });
+    await updateMany('recurring_rules', { created_by: person.id }, { created_by: requestedById });
+    await updateMany('comments', { author_id: person.id, $or: [{ author_name: null }, { author_name: '' }] }, { author_name: person.name });
+    await updateMany('comments', { author_id: person.id }, { author_id: requestedById });
+    await updateMany('timeline_changes', { actor_id: person.id, $or: [{ actor_name: null }, { actor_name: '' }] }, { actor_name: person.name });
+    await updateMany('timeline_changes', { actor_id: person.id }, { actor_id: requestedById });
+    await updateMany('task_requests', { requester_id: person.id }, { requester_id: requestedById });
+    await updateMany('office_chores', { requester_id: person.id }, { requester_id: requestedById });
+    await deleteMany('attendance', { user_id: person.id });
+    await deleteMany('notifications', { user_id: person.id });
+    await deleteMany('activity', { actor_id: person.id });
+    await deleteMany('project_members', { user_id: person.id });
+    const requests = await findMany('departure_requests', { user_id: person.id });
+    if (requests.length) await deleteMany('departure_items', { request_id: { $in: requests.map((item) => item.id) } });
+    await deleteMany('departure_requests', { user_id: person.id });
+    await deleteMany('departure_holds', { user_id: person.id });
+    await deleteMany('task_dependencies', { $or: [{ requester_id: person.id }, { depends_on_id: person.id }] });
+    await updateMany('tenders', { created_by: person.id }, { created_by: requestedById });
+    await updateMany('hiring_positions', { created_by: person.id }, { created_by: requestedById });
+    await updateMany('hiring_resumes', { uploaded_by: person.id }, { uploaded_by: requestedById });
+    await updateMany('hiring_resumes', { reviewer_id: person.id }, { reviewer_id: null });
+    await updateMany('hiring_resumes', { user_id: person.id }, { user_id: null });
+    await updateMany('knowledge_items', { user_id: person.id }, { user_id: null });
+    await updateMany('knowledge_items', { author_id: person.id }, { author_id: null });
+    await updateMany('reports', { author_id: person.id }, { author_id: requestedById });
+    await deleteMany('personal_notes', { user_id: person.id });
+    await deleteMany('notepad_days', { user_id: person.id });
+    await deleteMany('user_departments', { user_id: person.id });
+    await deleteOne('users', { _id: person.id });
+    const keeper = await findOne('users', { _id: requestedById });
+    if (keeper) await logActivity(keeper.id, `${keeper.name} removed ${person.name} from the office.`);
+  });
 }
 
-
-
-function openDependencyBlock(taskId) {
-  const names = db.prepare(`
-    SELECT u.name FROM task_dependencies d
-    JOIN users u ON u.id = d.depends_on_id
-    WHERE d.task_id = ? AND d.status = 'open'
-    ORDER BY u.name
-  `).all(taskId).map((row) => row.name);
+async function openDependencyBlock(taskId) {
+  const deps = await findMany('task_dependencies', { task_id: taskId, status: 'open' });
+  if (!deps.length) return null;
+  const users = await usersByIds(deps.map((dep) => dep.depends_on_id));
+  const names = deps.map((dep) => users.get(dep.depends_on_id)?.name).filter(Boolean).sort((left, right) => left.localeCompare(right));
   if (!names.length) return null;
   return `This task is waiting on ${nameList(names)}.`;
 }
 
 function hasKtDocument(userId) {
-  return Boolean(db.prepare(`SELECT 1 FROM knowledge_items WHERE kind = 'kt' AND user_id = ? AND file_stored IS NOT NULL AND file_stored != ''`).get(userId));
+  return exists('knowledge_items', { kind: 'kt', user_id: userId, file_stored: { $nin: [null, ''] } });
 }
 
-function rememberDeparture(person, admin) {
-  db.prepare('INSERT OR IGNORE INTO departure_holds (user_id, requested_by, created_at) VALUES (?, ?, ?)').run(person.id, admin.id, now());
-  if (!hasKtDocument(person.id)) {
-    notify(person.id, `${admin.name} asked to remove your account. Upload your KT document in Knowledge before it can be removed.`, null, null, 'knowledge');
+async function rememberDeparture(person, admin) {
+  await insertIgnore('departure_holds', {
+    _id: person.id,
+    user_id: person.id,
+    requested_by: admin.id,
+    created_at: now(),
+  });
+  if (!await hasKtDocument(person.id)) {
+    await notify(person.id, `${admin.name} asked to remove your account. Upload your KT document in Knowledge before it can be removed.`, null, null, 'knowledge');
   }
 }
 
-function maybeFinishDeparture(personId, actor) {
-  const open = db.prepare(`SELECT COUNT(*) AS n FROM departure_requests WHERE user_id = ? AND status = 'open'`).get(personId).n;
+async function maybeFinishDeparture(personId, actor) {
+  const open = await count('departure_requests', { user_id: personId, status: 'open' });
   if (open) return { removed: false, message: 'Tasks moved. Waiting on the other team lead.' };
-  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(personId);
+  const person = await findOne('users', { _id: personId });
   if (!person) return { removed: true, message: 'This person is already gone.' };
-  const request = db.prepare('SELECT requested_by FROM departure_holds WHERE user_id = ?').get(personId)
-    || db.prepare(`SELECT requested_by FROM departure_requests WHERE user_id = ? AND status != 'open' ORDER BY created_at LIMIT 1`).get(personId);
+  const hold = await findOne('departure_holds', { user_id: personId });
+  let request = hold;
+  if (!request) {
+    const closed = await findMany('departure_requests', { user_id: personId, status: { $ne: 'open' } });
+    closed.sort((left, right) => left.created_at.localeCompare(right.created_at));
+    request = closed[0] || null;
+  }
   if (!request) return { removed: false, message: 'KT document saved' };
-  if (!hasKtDocument(personId)) {
+  if (!await hasKtDocument(personId)) {
     return { removed: false, message: `${person.name} still needs to upload a KT document.` };
   }
-  eraseUser(person, request.requested_by || actor.id, actor);
+  await eraseUser(person, request.requested_by || actor.id);
   return { removed: true, message: `${person.name} was removed.` };
 }
 
-function assertTeammate(assigneeId, departmentIds, exceptId) {
-  const assignee = activeUser(assigneeId);
+async function assertTeammate(assigneeId, departmentIds, exceptId) {
+  const assignee = await activeUser(assigneeId);
   if (!assignee || assignee.id === exceptId) throw httpError(400, 'Choose someone else on the team');
-  const allowed = teammates(String(departmentIds || '').split(',').filter(Boolean), exceptId);
+  const allowed = await teammates(String(departmentIds || '').split(',').filter(Boolean), exceptId);
   if (!allowed.some((person) => person.id === assignee.id)) throw httpError(400, 'Choose someone on that team');
   return assignee;
 }
 
-function moveDepartureTask(task, assignee, person, actor) {
+async function moveDepartureTask(task, assignee, person, actor) {
   if (task.assignee_id === assignee.id) return;
   if (task.project_id) {
-    db.prepare('INSERT OR IGNORE INTO project_members (project_id, user_id) VALUES (?, ?)').run(task.project_id, assignee.id);
+    await insertIgnore('project_members', {
+      _id: `${task.project_id}:${assignee.id}`,
+      project_id: task.project_id,
+      user_id: assignee.id,
+    });
   }
-  db.prepare('UPDATE tasks SET assignee_id = ?, updated_at = ? WHERE id = ?').run(assignee.id, now(), task.id);
-  notify(assignee.id, `${actor.name} assigned “${task.title}” to you.`, task.id, task.project_id, 'board');
-  logActivity(actor.id, `${actor.name} moved “${task.title}” from ${person.name} to ${assignee.name}.`, task.id, task.project_id);
+  await updateOne('tasks', { _id: task.id }, { assignee_id: assignee.id, updated_at: now() });
+  await notify(assignee.id, `${actor.name} assigned “${task.title}” to you.`, task.id, task.project_id, 'board');
+  await logActivity(actor.id, `${actor.name} moved “${task.title}” from ${person.name} to ${assignee.name}.`, task.id, task.project_id);
 }
 
-function startDeparture(person, admin) {
-  const openTasks = db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE assignee_id = ? AND status != 'done' AND recurring_rule_id IS NULL`).get(person.id).n;
-  const rules = db.prepare('SELECT COUNT(*) AS n FROM recurring_rules WHERE assignee_id = ?').get(person.id).n;
+async function startDeparture(person, admin) {
+  const openTasks = await count('tasks', { assignee_id: person.id, status: { $ne: 'done' }, recurring_rule_id: null });
+  const rules = await count('recurring_rules', { assignee_id: person.id });
   if (!openTasks && !rules) {
-    if (!hasKtDocument(person.id)) {
-      rememberDeparture(person, admin);
+    if (!await hasKtDocument(person.id)) {
+      await rememberDeparture(person, admin);
       return { ok: true, pending: true, message: `Waiting on ${person.name} to upload a KT document. The account is removed once that file is in.` };
     }
-    eraseUser(person, admin.id, admin);
+    await eraseUser(person, admin.id);
     return { ok: true, pending: false };
   }
-  const { departments, buckets } = departureBuckets(person.id);
+  const { departments, buckets } = await departureBuckets(person.id);
   if (!departments.length) throw httpError(400, `Add ${person.name} to a department with a team lead before removing them.`);
   const missing = departments.filter((department) => !department.leadId);
   if (missing.length) {
@@ -887,30 +1007,48 @@ function startDeparture(person, admin) {
   if (!active.length) throw httpError(400, `No team lead can take ${person.name}’s tasks.`);
   for (const bucket of active) {
     for (const item of [...bucket.tasks, ...bucket.rules]) {
-      if (!teammates(item.departmentIds, person.id).length) {
-        const names = item.departmentIds.map((id) => departments.find((department) => department.id === id)?.name).filter(Boolean);
+      if (!(await teammates(item.departmentIds, person.id)).length) {
+        const names = item.departmentIds.map((departmentId) => departments.find((department) => department.id === departmentId)?.name).filter(Boolean);
         throw httpError(400, `No one else on ${nameList(names)} can take ${person.name}’s tasks.`);
       }
     }
   }
   for (const bucket of active) {
     const requestId = id('dpr');
-    db.prepare(`
-      INSERT INTO departure_requests (id, user_id, lead_id, requested_by, status, created_at)
-      VALUES (?, ?, ?, ?, 'open', ?)
-    `).run(requestId, person.id, bucket.leadId, admin.id, now());
-    const insertItem = db.prepare(`
-      INSERT INTO departure_items (id, request_id, task_id, rule_id, department_ids, done)
-      VALUES (?, ?, ?, ?, ?, 0)
-    `);
-    for (const task of bucket.tasks) insertItem.run(id('dpi'), requestId, task.id, null, task.departmentIds.join(','));
-    for (const rule of bucket.rules) insertItem.run(id('dpi'), requestId, null, rule.id, rule.departmentIds.join(','));
-    notify(bucket.leadId, `${admin.name} wants ${person.name} removed. Move their tasks to someone on your team.`, null, null, 'requests');
+    await insertOne('departure_requests', {
+      id: requestId,
+      user_id: person.id,
+      lead_id: bucket.leadId,
+      requested_by: admin.id,
+      status: 'open',
+      created_at: now(),
+    });
+    for (const task of bucket.tasks) {
+      await insertOne('departure_items', {
+        id: id('dpi'),
+        request_id: requestId,
+        task_id: task.id,
+        rule_id: null,
+        department_ids: task.departmentIds.join(','),
+        done: 0,
+      });
+    }
+    for (const rule of bucket.rules) {
+      await insertOne('departure_items', {
+        id: id('dpi'),
+        request_id: requestId,
+        task_id: null,
+        rule_id: rule.id,
+        department_ids: rule.departmentIds.join(','),
+        done: 0,
+      });
+    }
+    await notify(bucket.leadId, `${admin.name} wants ${person.name} removed. Move their tasks to someone on your team.`, null, null, 'requests');
   }
   const names = nameList(active.map((bucket) => bucket.leadName));
-  rememberDeparture(person, admin);
-  logActivity(admin.id, `${admin.name} asked ${names} to move ${person.name}’s tasks before removing them.`);
-  const kt = hasKtDocument(person.id) ? '' : ` ${person.name} also has to upload a KT document.`;
+  await rememberDeparture(person, admin);
+  await logActivity(admin.id, `${admin.name} asked ${names} to move ${person.name}’s tasks before removing them.`);
+  const kt = await hasKtDocument(person.id) ? '' : ` ${person.name} also has to upload a KT document.`;
   return {
     ok: true,
     pending: true,
@@ -918,139 +1056,149 @@ function startDeparture(person, admin) {
   };
 }
 
-app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
-  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+app.delete('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
+  const person = await findOne('users', { _id: req.params.id });
   if (!person) return bad(res, 404, 'Person not found');
   if (person.id === req.auth.id) return bad(res, 400, 'You can’t delete your own account');
   if (person.role === 'admin') {
-    const others = db.prepare(`SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = 1 AND id != ?`).get(person.id).n;
+    const others = await count('users', { role: 'admin', active: 1, _id: { $ne: person.id } });
     if (!others) return bad(res, 400, 'Keep at least one active admin');
   }
-  const leading = db.prepare('SELECT name FROM departments WHERE lead_id = ? ORDER BY name').all(person.id);
+  const leading = (await findMany('departments', { lead_id: person.id })).sort(byName);
   if (leading.length) {
     return bad(res, 400, `${person.name} still leads ${leading.map((item) => item.name).join(', ')}. Choose a new lead first.`);
   }
-  const created = db.prepare('SELECT COUNT(*) AS n FROM projects WHERE created_by = ?').get(person.id).n;
+  const created = await count('projects', { created_by: person.id });
   if (created) return bad(res, 400, `${person.name} created projects that are still here, so this account can’t be deleted.`);
-  const waiting = db.prepare(`
-    SELECT DISTINCT u.name
-    FROM departure_requests d
-    JOIN users u ON u.id = d.lead_id
-    WHERE d.user_id = ? AND d.status = 'open'
-    ORDER BY u.name
-  `).all(person.id);
+  const waitingRows = await findMany('departure_requests', { user_id: person.id, status: 'open' });
+  const waitingUsers = await usersByIds(waitingRows.map((row) => row.lead_id));
+  const waiting = [...new Set(waitingRows.map((row) => waitingUsers.get(row.lead_id)?.name).filter(Boolean))].sort((left, right) => left.localeCompare(right));
   if (waiting.length) {
-    return bad(res, 400, `Waiting on ${nameList(waiting.map((item) => item.name))} to move ${person.name}’s tasks.`);
+    return bad(res, 400, `Waiting on ${nameList(waiting)} to move ${person.name}’s tasks.`);
   }
   try {
-    const result = db.transaction(() => startDeparture(person, req.auth))();
+    const result = await withTx(() => startDeparture(person, req.auth));
     res.json(result);
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
     throw error;
   }
-});
+}));
 
-app.get('/api/departments', requireAuth, (_req, res) => {
-  const departments = db.prepare('SELECT id, name, lead_id AS leadId, created_at AS createdAt FROM departments ORDER BY name').all().map((department) => ({
-    ...department,
-    leadName: department.leadId ? db.prepare('SELECT name FROM users WHERE id = ?').get(department.leadId)?.name || null : null,
-    members: db.prepare(`
-      SELECT u.id, u.name, u.active FROM users u
-      JOIN user_departments ud ON ud.user_id = u.id
-      WHERE ud.department_id = ?
-      ORDER BY u.name
-    `).all(department.id).map((member) => ({ ...member, active: Boolean(member.active) })),
-  }));
-  res.json({ departments });
-});
+app.get('/api/departments', requireAuth, wrap(async (_req, res) => {
+  const departments = (await findMany('departments', {})).sort(byName);
+  const leads = await usersByIds(departments.map((department) => department.lead_id));
+  const links = await findMany('user_departments', {});
+  const members = await usersByIds(links.map((link) => link.user_id));
+  res.json({
+    departments: departments.map((department) => ({
+      id: department.id,
+      name: department.name,
+      leadId: department.lead_id || null,
+      createdAt: department.created_at,
+      leadName: department.lead_id ? (leads.get(department.lead_id)?.name || null) : null,
+      members: links
+        .filter((link) => link.department_id === department.id)
+        .map((link) => members.get(link.user_id))
+        .filter(Boolean)
+        .sort(byName)
+        .map((member) => ({ id: member.id, name: member.name, active: Boolean(member.active) })),
+    })),
+  });
+}));
 
-app.post('/api/departments', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/departments', requireAuth, requireAdmin, wrap(async (req, res) => {
   const name = readText(req.body.name, 80, 'a department name', true);
   if (name.error) return bad(res, 400, name.error);
-  const lead = activeUser(req.body.leadId);
+  const lead = await activeUser(req.body.leadId);
   if (!lead) return bad(res, 400, 'Choose an active team lead');
   const departmentId = id('dep');
   try {
-    db.transaction(() => {
-      db.prepare('INSERT INTO departments (id, name, lead_id, created_at) VALUES (?, ?, ?, ?)').run(departmentId, name.value, lead.id, now());
-      db.prepare('INSERT OR IGNORE INTO user_departments (user_id, department_id) VALUES (?, ?)').run(lead.id, departmentId);
-      logActivity(req.auth.id, `${req.auth.name} added the ${name.value} department with ${lead.name} as lead.`);
-    })();
+    await withTx(async () => {
+      await insertOne('departments', { id: departmentId, name: name.value, lead_id: lead.id, created_at: now() });
+      await insertIgnore('user_departments', { _id: `${lead.id}:${departmentId}`, user_id: lead.id, department_id: departmentId });
+      await logActivity(req.auth.id, `${req.auth.name} added the ${name.value} department with ${lead.name} as lead.`);
+    });
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) return bad(res, 400, 'That department name is already in use');
     throw error;
   }
   res.status(201).json({ id: departmentId });
-});
+}));
 
-app.patch('/api/departments/:id', requireAuth, requireAdmin, (req, res) => {
-  const department = db.prepare('SELECT * FROM departments WHERE id = ?').get(req.params.id);
+app.patch('/api/departments/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
+  const department = await findOne('departments', { _id: req.params.id });
   if (!department) return bad(res, 404, 'Department not found');
   const name = readText(req.body.name ?? department.name, 80, 'a department name', true);
   if (name.error) return bad(res, 400, name.error);
   const leadId = req.body.leadId === undefined ? department.lead_id : req.body.leadId;
-  const lead = activeUser(leadId);
+  const lead = await activeUser(leadId);
   if (!lead) return bad(res, 400, 'Choose an active team lead');
   try {
-    db.transaction(() => {
-      db.prepare('UPDATE departments SET name = ?, lead_id = ? WHERE id = ?').run(name.value, lead.id, department.id);
-      db.prepare('INSERT OR IGNORE INTO user_departments (user_id, department_id) VALUES (?, ?)').run(lead.id, department.id);
-      logActivity(req.auth.id, `${req.auth.name} updated the ${name.value} department.`);
-    })();
+    await withTx(async () => {
+      await updateOne('departments', { _id: department.id }, { name: name.value, lead_id: lead.id });
+      await insertIgnore('user_departments', { _id: `${lead.id}:${department.id}`, user_id: lead.id, department_id: department.id });
+      await logActivity(req.auth.id, `${req.auth.name} updated the ${name.value} department.`);
+    });
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) return bad(res, 400, 'That department name is already in use');
     throw error;
   }
   res.json({ ok: true });
-});
+}));
 
-app.delete('/api/departments/:id', requireAuth, requireAdmin, (req, res) => {
-  const department = db.prepare('SELECT * FROM departments WHERE id = ?').get(req.params.id);
+app.delete('/api/departments/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
+  const department = await findOne('departments', { _id: req.params.id });
   if (!department) return bad(res, 404, 'Department not found');
-  const projects = db.prepare(`
-    SELECT p.name FROM projects p
-    JOIN project_departments pd ON pd.project_id = p.id
-    WHERE pd.department_id = ?
-    ORDER BY p.name
-  `).all(department.id);
+  const projectLinks = await findMany('project_departments', { department_id: department.id });
+  const projects = projectLinks.length
+    ? (await findMany('projects', { _id: { $in: projectLinks.map((link) => link.project_id) } })).sort(byName)
+    : [];
   if (projects.length) {
     return bad(res, 400, `${department.name} is still on ${projects.map((item) => item.name).join(', ')}. Remove it from those projects first.`);
   }
-  const onlyHere = db.prepare(`
-    SELECT u.name FROM users u
-    JOIN user_departments ud ON ud.user_id = u.id
-    WHERE ud.department_id = ?
-      AND (SELECT COUNT(*) FROM user_departments other WHERE other.user_id = u.id) = 1
-    ORDER BY u.name
-  `).all(department.id);
+  if (await count('hiring_positions', { department_id: department.id })) {
+    return bad(res, 400, `${department.name} still has hiring positions. Close those first.`);
+  }
+  const links = await findMany('user_departments', { department_id: department.id });
+  const userIds = links.map((link) => link.user_id);
+  const allLinks = userIds.length ? await findMany('user_departments', { user_id: { $in: userIds } }) : [];
+  const counts = new Map();
+  for (const link of allLinks) counts.set(link.user_id, (counts.get(link.user_id) || 0) + 1);
+  const onlyIds = userIds.filter((userId) => counts.get(userId) === 1);
+  const people = await usersByIds(onlyIds);
+  const onlyHere = onlyIds.map((userId) => people.get(userId)).filter(Boolean).sort(byName);
   if (onlyHere.length) {
     const names = onlyHere.map((item) => item.name).join(', ');
     const verb = onlyHere.length === 1 ? 'belongs' : 'belong';
     return bad(res, 400, `${names} ${verb} only to ${department.name}. Move them to another department first.`);
   }
-  db.transaction(() => {
-    db.prepare('DELETE FROM user_departments WHERE department_id = ?').run(department.id);
-    db.prepare('DELETE FROM departments WHERE id = ?').run(department.id);
-    logActivity(req.auth.id, `${req.auth.name} removed the ${department.name} department.`);
-  })();
+  await withTx(async () => {
+    await deleteMany('user_departments', { department_id: department.id });
+    await deleteOne('departments', { _id: department.id });
+    await logActivity(req.auth.id, `${req.auth.name} removed the ${department.name} department.`);
+  });
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/projects', requireAuth, (req, res) => {
-  const rows = db.prepare(`
-    SELECT DISTINCT p.*
-    FROM projects p
-    LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = ?
-    LEFT JOIN project_departments pd ON pd.project_id = p.id
-    LEFT JOIN user_departments ud ON ud.department_id = pd.department_id AND ud.user_id = ?
-    WHERE ? = 1 OR pm.user_id IS NOT NULL OR ud.user_id IS NOT NULL
-    ORDER BY p.start_date, p.name
-  `).all(req.auth.id, req.auth.id, req.auth.isAdmin ? 1 : 0);
-  res.json({ projects: rows.map((row) => presentProject(row, req.auth)) });
-});
+app.get('/api/projects', requireAuth, wrap(async (req, res) => {
+  let rows;
+  if (req.auth.isAdmin) {
+    rows = await findMany('projects', {});
+  } else {
+    const memberships = await findMany('project_members', { user_id: req.auth.id });
+    const departmentIds = req.auth.departmentIds;
+    const byDepartment = departmentIds.length
+      ? await findMany('project_departments', { department_id: { $in: departmentIds } })
+      : [];
+    const ids = [...new Set([...memberships.map((link) => link.project_id), ...byDepartment.map((link) => link.project_id)])];
+    rows = ids.length ? await findMany('projects', { _id: { $in: ids } }) : [];
+  }
+  rows.sort((left, right) => left.start_date.localeCompare(right.start_date) || left.name.localeCompare(right.name));
+  res.json({ projects: await presentProjects(rows, req.auth) });
+}));
 
-app.post('/api/projects', requireAuth, (req, res) => {
+app.post('/api/projects', requireAuth, wrap(async (req, res) => {
   if (!req.auth.isAdmin && !req.auth.isLead) return bad(res, 403, 'Only an admin or a team lead can create a project');
   const name = readText(req.body.name, 120, 'a project name', true);
   if (name.error) return bad(res, 400, name.error);
@@ -1064,41 +1212,48 @@ app.post('/api/projects', requireAuth, (req, res) => {
   const memberIds = uniqueList(req.body.memberIds);
   if (!departmentIds.length) return bad(res, 400, 'Choose at least one department');
   if (!memberIds.length) return bad(res, 400, 'Add at least one person');
-  const departmentMarks = departmentIds.map(() => '?').join(',');
-  const foundDepartments = db.prepare(`SELECT id FROM departments WHERE id IN (${departmentMarks})`).all(...departmentIds);
+  const foundDepartments = await findMany('departments', { _id: { $in: departmentIds } });
   if (foundDepartments.length !== departmentIds.length) return bad(res, 400, 'Choose a real department');
   for (const memberId of memberIds) {
-    const member = activeUser(memberId);
+    const member = await activeUser(memberId);
     if (!member) return bad(res, 400, 'Add active people only');
-    if (!userInDepartments(memberId, departmentIds)) {
+    if (!await userInDepartments(memberId, departmentIds)) {
       return bad(res, 400, `${member.name} is not in the selected departments`);
     }
   }
   const projectId = id('prj');
-  db.transaction(() => {
-    db.prepare(`
-      INSERT INTO projects (id, name, description, status, start_date, end_date, created_by, created_at)
-      VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
-    `).run(projectId, name.value, description.value, startDate, endDate, req.auth.id, now());
-    const addDepartment = db.prepare('INSERT INTO project_departments (project_id, department_id) VALUES (?, ?)');
-    for (const departmentId of departmentIds) addDepartment.run(projectId, departmentId);
-    const addMember = db.prepare('INSERT INTO project_members (project_id, user_id) VALUES (?, ?)');
-    for (const memberId of memberIds) addMember.run(projectId, memberId);
-    logActivity(req.auth.id, `${req.auth.name} created the project “${name.value}”.`, null, projectId);
-  })();
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
-  res.status(201).json({ project: presentProject(row, req.auth, true) });
-});
+  await withTx(async () => {
+    await insertOne('projects', {
+      id: projectId,
+      name: name.value,
+      description: description.value,
+      status: 'active',
+      start_date: startDate,
+      end_date: endDate,
+      created_by: req.auth.id,
+      created_at: now(),
+    });
+    for (const departmentId of departmentIds) {
+      await insertOne('project_departments', { _id: `${projectId}:${departmentId}`, project_id: projectId, department_id: departmentId });
+    }
+    for (const memberId of memberIds) {
+      await insertOne('project_members', { _id: `${projectId}:${memberId}`, project_id: projectId, user_id: memberId });
+    }
+    await logActivity(req.auth.id, `${req.auth.name} created the project “${name.value}”.`, null, projectId);
+  });
+  const row = await findOne('projects', { _id: projectId });
+  res.status(201).json({ project: await presentProject(row, req.auth, true) });
+}));
 
-app.get('/api/projects/:id', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+app.get('/api/projects/:id', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!canViewProject(req.auth, row.id)) return bad(res, 403, 'You can’t see this project');
-  res.json({ project: presentProject(row, req.auth, true) });
-});
+  if (!await canViewProject(req.auth, row.id)) return bad(res, 403, 'You can’t see this project');
+  res.json({ project: await presentProject(row, req.auth, true) });
+}));
 
-app.patch('/api/projects/:id', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+app.patch('/api/projects/:id', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
   if (!managesProject(req.auth, row)) return bad(res, 403, 'Only an admin or the person who created this project can change it');
   const name = readText(req.body.name, 120, 'a project name', true);
@@ -1107,36 +1262,29 @@ app.patch('/api/projects/:id', requireAuth, (req, res) => {
   if (description.error) return bad(res, 400, description.error);
   const status = req.body.status || row.status;
   if (!new Set(['active', 'paused', 'done']).has(status)) return bad(res, 400, 'Choose a project status');
-  db.prepare('UPDATE projects SET name = ?, description = ?, status = ? WHERE id = ?').run(name.value, description.value, status, row.id);
-  logActivity(req.auth.id, `${req.auth.name} updated the project “${name.value}”.`, null, row.id);
-  const fresh = db.prepare('SELECT * FROM projects WHERE id = ?').get(row.id);
-  res.json({ project: presentProject(fresh, req.auth, true) });
-});
+  await updateOne('projects', { _id: row.id }, { name: name.value, description: description.value, status });
+  await logActivity(req.auth.id, `${req.auth.name} updated the project “${name.value}”.`, null, row.id);
+  const fresh = await findOne('projects', { _id: row.id });
+  res.json({ project: await presentProject(fresh, req.auth, true) });
+}));
 
-app.delete('/api/projects/:id', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+app.delete('/api/projects/:id', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!canDeleteProject(req.auth, row)) return bad(res, 403, 'Only an admin or a team lead on this project can delete it');
-  const taskIds = db.prepare('SELECT id FROM tasks WHERE project_id = ?').all(row.id).map((item) => item.id);
-  db.transaction(() => {
-    if (taskIds.length) {
-      const marks = taskIds.map(() => '?').join(',');
-      db.prepare(`UPDATE tasks SET handoff_task_id = NULL, updated_at = ? WHERE handoff_task_id IN (${marks})`).run(now(), ...taskIds);
-      db.prepare(`DELETE FROM tasks WHERE id IN (${marks})`).run(...taskIds);
-    }
-    db.prepare('DELETE FROM recurring_rules WHERE project_id = ?').run(row.id);
-    db.prepare('DELETE FROM projects WHERE id = ?').run(row.id);
-    logActivity(req.auth.id, `${req.auth.name} deleted the project “${row.name}” and its tasks.`);
-  })();
+  if (!await canDeleteProject(req.auth, row)) return bad(res, 403, 'Only an admin or a team lead on this project can delete it');
+  await withTx(async () => {
+    await removeProject(row.id);
+    await logActivity(req.auth.id, `${req.auth.name} deleted the project “${row.name}” and its tasks.`);
+  });
   res.json({ ok: true });
-});
+}));
 
-app.patch('/api/projects/:id/timeline', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+app.patch('/api/projects/:id/timeline', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!canViewProject(req.auth, row.id)) return bad(res, 403, 'You can’t see this project');
-  const leads = presentProject(row, req.auth).canEditTimeline;
-  if (!leads) return bad(res, 403, 'Only an admin or this project’s team lead can move the timeline');
+  if (!await canViewProject(req.auth, row.id)) return bad(res, 403, 'You can’t see this project');
+  const view = await presentProject(row, req.auth);
+  if (!view.canEditTimeline) return bad(res, 403, 'Only an admin or this project’s team lead can move the timeline');
   let reason = String(req.body.reason || '').trim();
   if (!req.auth.isAdmin && reason.length < 8) {
     return bad(res, 400, 'Write a short reason for the date change (at least 8 characters).');
@@ -1147,67 +1295,81 @@ app.patch('/api/projects/:id/timeline', requireAuth, (req, res) => {
   if (!isISODate(startDate) || !isISODate(endDate) || endDate < startDate) {
     return bad(res, 400, 'Check the project start and end dates');
   }
-  const before = timelineSnapshot(row.id);
-  db.transaction(() => {
-    db.prepare('UPDATE projects SET start_date = ?, end_date = ? WHERE id = ?').run(startDate, endDate, row.id);
-    const after = timelineSnapshot(row.id);
-    db.prepare(`
-      INSERT INTO timeline_changes (id, project_id, actor_id, reason, before_json, after_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id('tlc'), row.id, req.auth.id, reason, JSON.stringify(before), JSON.stringify(after), now());
-    logActivity(req.auth.id, `${req.auth.name} changed the timeline for ${row.name}. ${reason}`, null, row.id);
-  })();
-  notifyProject(row.id, req.auth, `${req.auth.name} changed the timeline for ${row.name}. ${reason}`);
-  const fresh = db.prepare('SELECT * FROM projects WHERE id = ?').get(row.id);
-  res.json({ project: presentProject(fresh, req.auth, true) });
-});
+  const before = await timelineSnapshot(row.id);
+  await withTx(async () => {
+    await updateOne('projects', { _id: row.id }, { start_date: startDate, end_date: endDate });
+    const after = await timelineSnapshot(row.id);
+    await insertOne('timeline_changes', {
+      id: id('tlc'),
+      project_id: row.id,
+      actor_id: req.auth.id,
+      actor_name: null,
+      reason,
+      before_json: JSON.stringify(before),
+      after_json: JSON.stringify(after),
+      created_at: now(),
+    });
+    await logActivity(req.auth.id, `${req.auth.name} changed the timeline for ${row.name}. ${reason}`, null, row.id);
+  });
+  await notifyProject(row.id, req.auth, `${req.auth.name} changed the timeline for ${row.name}. ${reason}`);
+  const fresh = await findOne('projects', { _id: row.id });
+  res.json({ project: await presentProject(fresh, req.auth, true) });
+}));
 
-app.post('/api/projects/:id/members', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+app.post('/api/projects/:id/members', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!canAssignOnProject(req.auth, row)) return bad(res, 403, 'A team lead on this project can add people');
-  const member = activeUser(req.body.userId);
+  if (!await canAssignOnProject(req.auth, row)) return bad(res, 403, 'A team lead on this project can add people');
+  const member = await activeUser(req.body.userId);
   if (!member) return bad(res, 400, 'Choose an active person');
-  if (isProjectMember(row.id, member.id)) return bad(res, 400, 'They are already on this project');
-  const departmentIds = db.prepare('SELECT department_id FROM project_departments WHERE project_id = ?').all(row.id).map((item) => item.department_id);
-  if (!userInDepartments(member.id, departmentIds)) {
+  if (await isProjectMember(row.id, member.id)) return bad(res, 400, 'They are already on this project');
+  const departmentIds = await projectDepartmentIds(row.id);
+  if (!await userInDepartments(member.id, departmentIds)) {
     return bad(res, 400, `${member.name} is not in this project’s departments`);
   }
-  db.prepare('INSERT INTO project_members (project_id, user_id) VALUES (?, ?)').run(row.id, member.id);
-  logActivity(req.auth.id, `${req.auth.name} added ${member.name} to ${row.name}.`, null, row.id);
-  notify(member.id, `${req.auth.name} added you to ${row.name}.`, null, row.id);
-  res.json({ project: presentProject(db.prepare('SELECT * FROM projects WHERE id = ?').get(row.id), req.auth, true) });
-});
+  await insertOne('project_members', { _id: `${row.id}:${member.id}`, project_id: row.id, user_id: member.id });
+  await logActivity(req.auth.id, `${req.auth.name} added ${member.name} to ${row.name}.`, null, row.id);
+  await notify(member.id, `${req.auth.name} added you to ${row.name}.`, null, row.id);
+  res.json({ project: await presentProject(await findOne('projects', { _id: row.id }), req.auth, true) });
+}));
 
-app.delete('/api/projects/:id/members/:userId', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+app.delete('/api/projects/:id/members/:userId', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
-  if (!canAssignOnProject(req.auth, row)) return bad(res, 403, 'A team lead on this project can remove people');
-  const open = db.prepare(`
-    SELECT COUNT(*) AS n FROM tasks
-    WHERE project_id = ? AND assignee_id = ? AND status != 'done'
-  `).get(row.id, req.params.userId).n;
+  if (!await canAssignOnProject(req.auth, row)) return bad(res, 403, 'A team lead on this project can remove people');
+  const open = await count('tasks', { project_id: row.id, assignee_id: req.params.userId, status: { $ne: 'done' } });
   if (open) return bad(res, 400, 'They still have open work on this project');
-  db.prepare('DELETE FROM project_members WHERE project_id = ? AND user_id = ?').run(row.id, req.params.userId);
-  logActivity(req.auth.id, `${req.auth.name} removed a person from ${row.name}.`, null, row.id);
-  res.json({ project: presentProject(db.prepare('SELECT * FROM projects WHERE id = ?').get(row.id), req.auth, true) });
-});
+  await deleteOne('project_members', { project_id: row.id, user_id: req.params.userId });
+  await logActivity(req.auth.id, `${req.auth.name} removed a person from ${row.name}.`, null, row.id);
+  res.json({ project: await presentProject(await findOne('projects', { _id: row.id }), req.auth, true) });
+}));
 
-app.get('/api/tasks', requireAuth, (req, res) => {
+function matchesWeek(task, weekStart, weekEnd, isCurrent, includePrevious, prevStart) {
+  if (task.due_date >= weekStart && task.due_date <= weekEnd) return true;
+  const completed = String(task.completed_at || '').slice(0, 10);
+  if (task.status === 'done' && completed.length === 10 && completed >= weekStart && completed <= weekEnd) return true;
+  if (isCurrent && task.due_date > weekEnd && task.status !== 'done' && task.parent_task_id) return true;
+  if (includePrevious && task.due_date >= prevStart && task.due_date < weekStart && task.status !== 'done') return true;
+  return false;
+}
+
+function byDue(left, right) {
+  return left.due_date.localeCompare(right.due_date) || left.title.localeCompare(right.title);
+}
+
+app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   const scope = ['team', 'project', 'person'].includes(req.query.scope) ? req.query.scope : 'mine';
-  const where = [];
-  const params = [];
   let weekStart = null;
   let weekEnd = null;
   let isCurrent = false;
   let previousWeekStart = null;
+  let filter = {};
 
   if (scope === 'project') {
     const projectId = req.query.projectId;
     if (!projectId) return bad(res, 400, 'Choose a project');
-    if (!canViewProject(req.auth, projectId)) return bad(res, 403, 'You can’t see this project');
-    where.push('t.project_id = ?');
-    params.push(projectId);
+    if (!await canViewProject(req.auth, projectId)) return bad(res, 403, 'You can’t see this project');
+    filter = { project_id: projectId };
     weekEnd = '9999-99-99';
   } else {
     const requested = isISODate(req.query.week) ? req.query.week : isoDate(new Date());
@@ -1218,73 +1380,63 @@ app.get('/api/tasks', requireAuth, (req, res) => {
     const includePrevious = isCurrent && (scope === 'mine' || scope === 'person');
     if (includePrevious) previousWeekStart = weekStart;
     const prevStart = isoDate(addDays(monday, -7));
-    ensureRecurring(weekStart, weekEnd);
+    await ensureRecurring(weekStart, weekEnd);
     if (scope === 'mine' || scope === 'person') {
       const assigneeId = scope === 'person' ? req.query.userId : req.auth.id;
       if (scope === 'person') {
-        if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(assigneeId)) return bad(res, 404, 'Person not found');
-        if (!req.auth.isAdmin && !assigneeInLeadDepts(req.auth, assigneeId)) {
+        if (!await exists('users', { _id: assigneeId })) return bad(res, 404, 'Person not found');
+        if (!req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, assigneeId)) {
           return bad(res, 403, 'You can open boards for people on a team you lead');
         }
       }
-      where.push('t.assignee_id = ?');
-      params.push(assigneeId);
+      filter = { assignee_id: assigneeId };
     } else {
       const departmentId = req.query.departmentId;
       if (!departmentId) return bad(res, 400, 'Choose a department');
-      if (!db.prepare('SELECT 1 FROM departments WHERE id = ?').get(departmentId)) return bad(res, 404, 'Department not found');
+      if (!await exists('departments', { _id: departmentId })) return bad(res, 404, 'Department not found');
       if (!req.auth.isAdmin && !req.auth.departmentIds.includes(departmentId)) {
         return bad(res, 403, 'You are not in that department');
       }
-      where.push('t.assignee_id IN (SELECT user_id FROM user_departments WHERE department_id = ?)');
-      params.push(departmentId);
+      const members = await findMany('user_departments', { department_id: departmentId });
+      let assigneeIds = members.map((member) => member.user_id);
       const seesWholeTeam = req.auth.isAdmin || req.auth.leadDepartmentIds.includes(departmentId);
-      if (!seesWholeTeam) {
-        where.push('t.assignee_id = ?');
-        params.push(req.auth.id);
+      if (!seesWholeTeam) assigneeIds = assigneeIds.filter((userId) => userId === req.auth.id);
+      filter = { assignee_id: { $in: assigneeIds } };
+    }
+    const candidates = await findMany('tasks', filter);
+    let rows = candidates.filter((task) => matchesWeek(task, weekStart, weekEnd, isCurrent, includePrevious, prevStart));
+    if (isCurrent) {
+      const hasTodo = rows.some((row) => row.status === 'upcoming' && row.due_date >= weekStart && row.due_date <= weekEnd);
+      if (!hasTodo) {
+        const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
+        const seen = new Set(rows.map((row) => row.id));
+        const extra = candidates
+          .filter((task) => !seen.has(task.id) && task.status !== 'done' && task.due_date > weekEnd && task.due_date <= horizon)
+          .map((task) => ({ ...task, from_next: 1 }));
+        rows = rows.concat(extra);
       }
     }
-    where.push(`(
-      (t.due_date >= ? AND t.due_date <= ?)
-      OR (t.status = 'done' AND substr(t.completed_at, 1, 10) >= ? AND substr(t.completed_at, 1, 10) <= ?)
-      OR (? = 1 AND t.due_date > ? AND t.status != 'done' AND t.parent_task_id IS NOT NULL)
-      OR (? = 1 AND t.due_date >= ? AND t.due_date < ? AND t.status != 'done')
-    )`);
-    params.push(weekStart, weekEnd, weekStart, weekEnd, isCurrent ? 1 : 0, weekEnd, includePrevious ? 1 : 0, prevStart, weekStart);
+    rows.sort(byDue);
+    const hydrated = await hydrateTasks(rows);
+    return res.json({
+      tasks: hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart)),
+      weekStart,
+      weekEnd,
+      isCurrent,
+    });
   }
 
-  let rows = db.prepare(`
-    ${TASK_SQL}
-    WHERE ${where.join(' AND ')}
-    ORDER BY t.due_date, t.title
-  `).all(...params);
-  if (isCurrent && scope !== 'project') {
-    const hasTodo = rows.some((row) => row.status === 'upcoming' && row.due_date >= weekStart && row.due_date <= weekEnd);
-    if (!hasTodo) {
-      const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
-      const scopeWhere = where.slice(0, -1);
-      const scopeParams = params.slice(0, -9);
-      const extra = db.prepare(`
-        ${TASK_SQL}
-        WHERE ${scopeWhere.join(' AND ')}
-          AND t.status != 'done'
-          AND t.due_date > ?
-          AND t.due_date <= ?
-        ORDER BY t.due_date, t.title
-      `).all(...scopeParams, weekEnd, horizon);
-      const seen = new Set(rows.map((row) => row.id));
-      rows = rows.concat(extra.filter((row) => !seen.has(row.id)).map((row) => ({ ...row, from_next: 1 })));
-    }
-  }
+  const rows = (await findMany('tasks', filter)).sort(byDue);
+  const hydrated = await hydrateTasks(rows);
   res.json({
-    tasks: rows.map((row) => mapTask(row, weekEnd, previousWeekStart)),
+    tasks: hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart)),
     weekStart,
-    weekEnd: scope === 'project' ? null : weekEnd,
+    weekEnd: null,
     isCurrent,
   });
-});
+}));
 
-app.post('/api/tasks', requireAuth, (req, res) => {
+app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
   const title = readText(req.body.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
   const description = readText(req.body.description, 4000, 'the description');
@@ -1292,25 +1444,25 @@ app.post('/api/tasks', requireAuth, (req, res) => {
   if (!isISODate(req.body.dueDate)) return bad(res, 400, 'Choose a due date');
   const priority = PRIORITIES.has(req.body.priority) ? req.body.priority : 'medium';
   const projectId = req.body.projectId || null;
-  let assigneeId = req.body.assigneeId || req.auth.id;
-  const project = projectId ? db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) : null;
+  const assigneeId = req.body.assigneeId || req.auth.id;
+  const project = projectId ? await findOne('projects', { _id: projectId }) : null;
   const assigningSomeoneElse = assigneeId !== req.auth.id;
   if (assigningSomeoneElse) {
-    const allowed = project ? canAssignOnProject(req.auth, project) : (req.auth.isAdmin || req.auth.isLead);
+    const allowed = project ? await canAssignOnProject(req.auth, project) : (req.auth.isAdmin || req.auth.isLead);
     if (!allowed) return bad(res, 403, 'You can add this task for yourself');
   }
-  const assignee = activeUser(assigneeId);
+  const assignee = await activeUser(assigneeId);
   if (!assignee) return bad(res, 400, 'Choose an active person');
   if (projectId) {
     if (!project) return bad(res, 404, 'Project not found');
     if (project.status === 'done') return bad(res, 400, 'This project is marked done');
-    const onProject = isProjectMember(projectId, req.auth.id) || canAssignOnProject(req.auth, project);
+    const onProject = await isProjectMember(projectId, req.auth.id) || await canAssignOnProject(req.auth, project);
     if (!onProject) return bad(res, 403, 'Only people on the project can add their part');
-    if (!isProjectMember(projectId, assigneeId)) return bad(res, 400, 'Add them to the project before assigning this task');
+    if (!await isProjectMember(projectId, assigneeId)) return bad(res, 400, 'Add them to the project before assigning this task');
   }
   try {
-    const taskId = db.transaction(() => {
-      const createdId = insertTaskRow({
+    const taskId = await withTx(async () => {
+      const createdId = await insertTaskRow({
         title: title.value,
         description: description.value,
         projectId,
@@ -1322,62 +1474,83 @@ app.post('/api/tasks', requireAuth, (req, res) => {
         kind: projectId ? 'project' : 'personal',
       });
       if (assigneeId !== req.auth.id) {
-        notify(assigneeId, `${req.auth.name} assigned “${title.value}” to you.`, createdId, projectId);
+        await notify(assigneeId, `${req.auth.name} assigned “${title.value}” to you.`, createdId, projectId);
       }
-      logActivity(req.auth.id, `${req.auth.name} added “${title.value}”.`, createdId, projectId);
-      if (req.body.handoff) createHandoff(createdId, req.auth, req.body.handoff);
+      await logActivity(req.auth.id, `${req.auth.name} added “${title.value}”.`, createdId, projectId);
+      if (req.body.handoff) await createHandoff(createdId, req.auth, req.body.handoff);
       return createdId;
-    })();
-    res.status(201).json({ task: mapTask(loadTask(taskId), '9999-99-99') });
+    });
+    res.status(201).json({ task: mapTask(await loadTask(taskId), '9999-99-99') });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
     throw error;
   }
-});
+}));
 
-app.get('/api/tasks/:id', requireAuth, (req, res) => {
-  const task = loadTask(req.params.id);
+app.get('/api/tasks/:id', requireAuth, wrap(async (req, res) => {
+  const task = await loadTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
-  if (!canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
-  const comments = db.prepare(`
-    SELECT c.id, c.body, c.created_at AS createdAt, c.author_id AS authorId, COALESCE(NULLIF(c.author_name, ''), u.name) AS authorName
-    FROM comments c JOIN users u ON u.id = c.author_id
-    WHERE c.task_id = ? ORDER BY c.created_at
-  `).all(task.id);
-  const requests = db.prepare(`
-    SELECT r.id, r.kind, r.note, r.status, r.created_at AS createdAt, r.requester_id AS requesterId, u.name AS requesterName
-    FROM task_requests r JOIN users u ON u.id = r.requester_id
-    WHERE r.task_id = ? AND r.status = 'open'
-    ORDER BY r.created_at
-  `).all(task.id);
-  const followups = db.prepare(`
-    SELECT t.id, t.title, t.status, t.due_date AS dueDate, t.assignee_id AS assigneeId, u.name AS assigneeName
-    FROM tasks t
-    JOIN users u ON u.id = t.assignee_id
-    WHERE t.parent_task_id = ?
-    ORDER BY t.due_date, t.title
-  `).all(task.id);
-  res.json({ task: mapTask(task, '9999-99-99'), comments, chain: taskChain(task.id), requests, followups });
-});
+  if (!await canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
+  const commentRows = (await findMany('comments', { task_id: task.id })).sort((left, right) => left.created_at.localeCompare(right.created_at));
+  const requestRows = (await findMany('task_requests', { task_id: task.id, status: 'open' })).sort((left, right) => left.created_at.localeCompare(right.created_at));
+  const followupRows = (await findMany('tasks', { parent_task_id: task.id })).sort(byDue);
+  const users = await usersByIds([
+    ...commentRows.map((comment) => comment.author_id),
+    ...requestRows.map((request) => request.requester_id),
+    ...followupRows.map((item) => item.assignee_id),
+  ]);
+  const comments = commentRows.map((comment) => ({
+    id: comment.id,
+    body: comment.body,
+    createdAt: comment.created_at,
+    authorId: comment.author_id,
+    authorName: String(comment.author_name || '').trim() || users.get(comment.author_id)?.name || '',
+  }));
+  const requests = requestRows.map((request) => ({
+    id: request.id,
+    kind: request.kind,
+    note: request.note,
+    status: request.status,
+    createdAt: request.created_at,
+    requesterId: request.requester_id,
+    requesterName: users.get(request.requester_id)?.name || '',
+  }));
+  const followups = followupRows.map((item) => ({
+    id: item.id,
+    title: item.title,
+    status: item.status,
+    dueDate: item.due_date,
+    assigneeId: item.assignee_id,
+    assigneeName: users.get(item.assignee_id)?.name || '',
+  }));
+  res.json({ task: mapTask(task, '9999-99-99'), comments, chain: await taskChain(task.id), requests, followups });
+}));
 
-app.post('/api/tasks/:id/comments', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.post('/api/tasks/:id/comments', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
-  if (!canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
+  if (!await canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
   const body = readText(req.body.body, 2000, 'a comment', true);
   if (body.error) return bad(res, 400, body.error);
-  db.prepare('INSERT INTO comments (id, task_id, author_id, body, created_at) VALUES (?, ?, ?, ?, ?)').run(id('cmt'), task.id, req.auth.id, body.value, now());
-  logActivity(req.auth.id, `${req.auth.name} commented on “${task.title}”.`, task.id, task.project_id);
+  await insertOne('comments', {
+    id: id('cmt'),
+    task_id: task.id,
+    author_id: req.auth.id,
+    author_name: null,
+    body: body.value,
+    created_at: now(),
+  });
+  await logActivity(req.auth.id, `${req.auth.name} commented on “${task.title}”.`, task.id, task.project_id);
   for (const userId of new Set([task.assignee_id, task.creator_id])) {
-    if (userId !== req.auth.id) notify(userId, `${req.auth.name} commented on “${task.title}”.`, task.id, task.project_id);
+    if (userId !== req.auth.id) await notify(userId, `${req.auth.name} commented on “${task.title}”.`, task.id, task.project_id);
   }
   res.status(201).json({ ok: true });
-});
+}));
 
-app.get('/api/trends', requireAuth, (req, res) => {
+app.get('/api/trends', requireAuth, wrap(async (req, res) => {
   const userId = req.query.userId || req.auth.id;
-  if (!db.prepare('SELECT 1 FROM users WHERE id = ? AND active = 1').get(userId)) return bad(res, 404, 'Person not found');
-  if (userId !== req.auth.id && !req.auth.isAdmin && !assigneeInLeadDepts(req.auth, userId)) {
+  if (!await exists('users', { _id: userId, active: 1 })) return bad(res, 404, 'Person not found');
+  if (userId !== req.auth.id && !req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, userId)) {
     return bad(res, 403, 'You can see trends for people on a team you lead');
   }
   const current = startOfWeek(new Date());
@@ -1395,10 +1568,7 @@ app.get('/api/trends', requireAuth, (req, res) => {
       completed: 0,
     });
   }
-  const rows = db.prepare(`
-    SELECT completed_at FROM tasks
-    WHERE assignee_id = ? AND status = 'done' AND completed_at IS NOT NULL
-  `).all(userId);
+  const rows = await findMany('tasks', { assignee_id: userId, status: 'done', completed_at: { $ne: null } });
   for (const row of rows) {
     const stamped = new Date(row.completed_at);
     if (Number.isNaN(stamped.getTime())) continue;
@@ -1413,27 +1583,27 @@ app.get('/api/trends', requireAuth, (req, res) => {
     weekly: weekly.map(({ start, completed }) => ({ start, completed })),
     monthly,
   });
-});
+}));
 
-app.post('/api/tasks/:id/followup', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.post('/api/tasks/:id/followup', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
-  if (!canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
-  if (!canGovernTask(req.auth, task)) return bad(res, 403, 'Only a team lead can assign a follow-up');
+  if (!await canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
+  if (!await canGovernTask(req.auth, task)) return bad(res, 403, 'Only a team lead can assign a follow-up');
   if (task.status !== 'review') return bad(res, 400, 'Assign a follow-up from a task that is in Review');
   const title = readText(req.body.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
   const description = readText(req.body.description, 4000, 'the description');
   if (description.error) return bad(res, 400, description.error);
   if (!isISODate(req.body.dueDate)) return bad(res, 400, 'Choose a due date');
-  const assignee = activeUser(req.body.assigneeId || task.assignee_id);
+  const assignee = await activeUser(req.body.assigneeId || task.assignee_id);
   if (!assignee) return bad(res, 400, 'Choose an active person');
-  if (task.project_id && !isProjectMember(task.project_id, assignee.id)) {
+  if (task.project_id && !await isProjectMember(task.project_id, assignee.id)) {
     return bad(res, 400, 'Add them to the project before assigning this follow-up');
   }
   try {
-    const childId = db.transaction(() => {
-      const createdId = insertTaskRow({
+    const childId = await withTx(async () => {
+      const createdId = await insertTaskRow({
         title: title.value,
         description: description.value,
         projectId: task.project_id,
@@ -1446,45 +1616,45 @@ app.post('/api/tasks/:id/followup', requireAuth, (req, res) => {
         parentTaskId: task.id,
       });
       if (!task.handoff_task_id) {
-        db.prepare('UPDATE tasks SET handoff_task_id = ?, updated_at = ? WHERE id = ?').run(createdId, now(), task.id);
+        await updateOne('tasks', { _id: task.id }, { handoff_task_id: createdId, updated_at: now() });
       }
       if (assignee.id !== req.auth.id) {
-        notify(assignee.id, `${req.auth.name} added “${title.value}” to your To do, following “${task.title}”.`, createdId, task.project_id);
+        await notify(assignee.id, `${req.auth.name} added “${title.value}” to your To do, following “${task.title}”.`, createdId, task.project_id);
       }
-      logActivity(req.auth.id, `${req.auth.name} assigned follow-up “${title.value}” to ${assignee.name}.`, createdId, task.project_id);
+      await logActivity(req.auth.id, `${req.auth.name} assigned follow-up “${title.value}” to ${assignee.name}.`, createdId, task.project_id);
       return createdId;
-    })();
-    res.status(201).json({ task: mapTask(loadTask(childId), '9999-99-99') });
+    });
+    res.status(201).json({ task: mapTask(await loadTask(childId), '9999-99-99') });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
     throw error;
   }
-});
+}));
 
-app.post('/api/tasks/:id/handoff', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.post('/api/tasks/:id/handoff', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
-  if (!canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
+  if (!await canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
   if (!req.auth.isAdmin && req.auth.id !== task.assignee_id) {
     return bad(res, 403, 'Only the person doing this task can name who takes it next');
   }
   try {
-    const childId = db.transaction(() => createHandoff(task.id, req.auth, req.body))();
-    res.status(201).json({ task: mapTask(loadTask(childId), '9999-99-99') });
+    const childId = await withTx(() => createHandoff(task.id, req.auth, req.body));
+    res.status(201).json({ task: mapTask(await loadTask(childId), '9999-99-99') });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
     throw error;
   }
-});
+}));
 
-app.patch('/api/tasks/:id/status', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.patch('/api/tasks/:id/status', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
   if (!STATUSES.has(req.body.status)) return bad(res, 400, 'Choose a status');
-  if (!canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
+  if (!await canSeeTask(req.auth, task)) return bad(res, 403, 'You can’t see this task');
   const next = req.body.status;
   if (next !== task.status) {
-    const governs = canGovernTask(req.auth, task);
+    const governs = await canGovernTask(req.auth, task);
     const ownStep = req.auth.id === task.assignee_id && (
       (task.status === 'upcoming' && next === 'in_progress')
       || (task.status === 'in_progress' && next === 'review')
@@ -1494,19 +1664,19 @@ app.patch('/api/tasks/:id/status', requireAuth, (req, res) => {
       return bad(res, 403, 'Move this from To do to In progress, then to Review for your team lead');
     }
     if (next === 'done') {
-      const waiting = openDependencyBlock(task.id);
+      const waiting = await openDependencyBlock(task.id);
       if (waiting) return bad(res, 400, waiting);
     }
-    writeStatus(task.id, next, task.completed_at);
-    noteStatus(task, next, req.auth);
+    await writeStatus(task.id, next, task.completed_at);
+    await noteStatus(task, next, req.auth);
   }
-  res.json({ task: mapTask(loadTask(task.id), '9999-99-99') });
-});
+  res.json({ task: mapTask(await loadTask(task.id), '9999-99-99') });
+}));
 
-app.patch('/api/tasks/:id', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.patch('/api/tasks/:id', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
-  if (!canGovernTask(req.auth, task)) return bad(res, 403, 'Only an admin or the team lead can edit this task');
+  if (!await canGovernTask(req.auth, task)) return bad(res, 403, 'Only an admin or the team lead can edit this task');
   const title = readText(req.body.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
   const description = readText(req.body.description, 4000, 'the description');
@@ -1514,237 +1684,251 @@ app.patch('/api/tasks/:id', requireAuth, (req, res) => {
   if (!isISODate(req.body.dueDate)) return bad(res, 400, 'Choose a due date');
   if (!PRIORITIES.has(req.body.priority)) return bad(res, 400, 'Choose a priority');
   if (!STATUSES.has(req.body.status)) return bad(res, 400, 'Choose a status');
-  const assignee = activeUser(req.body.assigneeId);
+  const assignee = await activeUser(req.body.assigneeId);
   if (!assignee) return bad(res, 400, 'Choose an active person');
-  if (task.project_id && !isProjectMember(task.project_id, assignee.id)) {
+  if (task.project_id && !await isProjectMember(task.project_id, assignee.id)) {
     return bad(res, 400, 'The assignee needs to be on this project');
   }
   if (req.body.status === 'done' && task.status !== 'done') {
-    const waiting = openDependencyBlock(task.id);
+    const waiting = await openDependencyBlock(task.id);
     if (waiting) return bad(res, 400, waiting);
   }
   const completedAt = req.body.status === 'done' ? (task.status === 'done' && task.completed_at ? task.completed_at : now()) : null;
-  db.prepare(`
-    UPDATE tasks
-    SET title = ?, description = ?, assignee_id = ?, due_date = ?, priority = ?, stage_id = NULL, status = ?, completed_at = ?, updated_at = ?
-    WHERE id = ?
-  `).run(title.value, description.value, assignee.id, req.body.dueDate, req.body.priority, req.body.status, completedAt, now(), task.id);
+  await updateOne('tasks', { _id: task.id }, {
+    title: title.value,
+    description: description.value,
+    assignee_id: assignee.id,
+    due_date: req.body.dueDate,
+    priority: req.body.priority,
+    stage_id: null,
+    status: req.body.status,
+    completed_at: completedAt,
+    updated_at: now(),
+  });
   if (assignee.id !== task.assignee_id) {
-    notify(assignee.id, `${req.auth.name} assigned “${title.value}” to you.`, task.id, task.project_id);
+    await notify(assignee.id, `${req.auth.name} assigned “${title.value}” to you.`, task.id, task.project_id);
   }
-  logActivity(req.auth.id, `${req.auth.name} edited “${title.value}”.`, task.id, task.project_id);
-  if (req.body.status !== task.status) noteStatus({ ...task, title: title.value }, req.body.status, req.auth);
-  res.json({ task: mapTask(loadTask(task.id), '9999-99-99') });
-});
+  await logActivity(req.auth.id, `${req.auth.name} edited “${title.value}”.`, task.id, task.project_id);
+  if (req.body.status !== task.status) await noteStatus({ ...task, title: title.value }, req.body.status, req.auth);
+  res.json({ task: mapTask(await loadTask(task.id), '9999-99-99') });
+}));
 
-app.post('/api/tasks/:id/removal', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.post('/api/tasks/:id/removal', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
   if (req.auth.id !== task.assignee_id) return bad(res, 403, 'Ask from the person this task is assigned to');
-  if (canGovernTask(req.auth, task)) return bad(res, 400, 'You can delete this task directly');
+  if (await canGovernTask(req.auth, task)) return bad(res, 400, 'You can delete this task directly');
   const note = readText(req.body.note, 500, 'a note for your team lead', true);
   if (note.error) return bad(res, 400, note.error);
   if (note.value.length < 8) return bad(res, 400, 'Write a short note for your team lead (at least 8 characters)');
-  if (db.prepare(`SELECT 1 FROM task_requests WHERE task_id = ? AND kind = 'remove' AND status = 'open'`).get(task.id)) {
+  if (await exists('task_requests', { task_id: task.id, kind: 'remove', status: 'open' })) {
     return bad(res, 400, 'You already asked your team lead to remove this');
   }
-  openRequest(task, 'remove', req.auth, note.value);
-  for (const userId of requestRecipients(task)) {
-    notify(userId, `${req.auth.name} asked to remove “${task.title}”. ${note.value}`, task.id, task.project_id, 'requests');
+  await openRequest(task, 'remove', req.auth, note.value);
+  for (const userId of await requestRecipients(task)) {
+    await notify(userId, `${req.auth.name} asked to remove “${task.title}”. ${note.value}`, task.id, task.project_id, 'requests');
   }
-  logActivity(req.auth.id, `${req.auth.name} asked to remove “${task.title}”.`, task.id, task.project_id);
+  await logActivity(req.auth.id, `${req.auth.name} asked to remove “${task.title}”.`, task.id, task.project_id);
   res.status(201).json({ ok: true });
-});
+}));
 
-app.delete('/api/tasks/:id', requireAuth, (req, res) => {
-  const task = rawTask(req.params.id);
+app.delete('/api/tasks/:id', requireAuth, wrap(async (req, res) => {
+  const task = await rawTask(req.params.id);
   if (!task) return bad(res, 404, 'Task not found');
-  if (!canGovernTask(req.auth, task)) return bad(res, 403, 'Ask your team lead to remove this, and include a note');
-  db.prepare('UPDATE tasks SET handoff_task_id = NULL, updated_at = ? WHERE handoff_task_id = ?').run(now(), task.id);
-  db.prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
-  logActivity(req.auth.id, `${req.auth.name} deleted “${task.title}”.`, null, task.project_id);
+  if (!await canGovernTask(req.auth, task)) return bad(res, 403, 'Ask your team lead to remove this, and include a note');
+  await deleteTask(task.id);
+  await logActivity(req.auth.id, `${req.auth.name} deleted “${task.title}”.`, null, task.project_id);
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/requests', requireAuth, (req, res) => {
-  const rows = db.prepare(`
-    SELECT r.id, r.kind, r.note, r.status, r.created_at AS createdAt,
-      r.requester_id AS requesterId, ru.name AS requesterName,
-      t.id AS taskId, t.title AS taskTitle, t.status AS taskStatus,
-      t.assignee_id AS assigneeId, t.creator_id AS creatorId, au.name AS assigneeName
-    FROM task_requests r
-    JOIN tasks t ON t.id = r.task_id
-    JOIN users ru ON ru.id = r.requester_id
-    JOIN users au ON au.id = t.assignee_id
-    WHERE r.status = 'open'
-    ORDER BY r.created_at DESC
-  `).all();
-  const requests = rows
-    .filter((row) => req.auth.isAdmin || row.requesterId === req.auth.id || canHandleRequest(req.auth, row))
-    .map((row) => ({
+app.get('/api/requests', requireAuth, wrap(async (req, res) => {
+  const open = (await findMany('task_requests', { status: 'open' })).sort((left, right) => right.created_at.localeCompare(left.created_at));
+  const tasks = await findMany('tasks', { _id: { $in: open.map((request) => request.task_id) } });
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  const users = await usersByIds([
+    ...open.map((request) => request.requester_id),
+    ...tasks.map((task) => task.assignee_id),
+  ]);
+  const rows = open.flatMap((request) => {
+    const task = taskMap.get(request.task_id);
+    if (!task) return [];
+    return [{
+      ...request,
+      assignee_id: task.assignee_id,
+      creator_id: task.creator_id,
+      requesterId: request.requester_id,
+      requesterName: users.get(request.requester_id)?.name || '',
+      taskId: task.id,
+      taskTitle: task.title,
+      taskStatus: task.status,
+      assigneeName: users.get(task.assignee_id)?.name || '',
+    }];
+  });
+  const requests = [];
+  for (const row of rows) {
+    if (!(req.auth.isAdmin || row.requesterId === req.auth.id || await canHandleRequest(req.auth, row))) continue;
+    requests.push({
       id: row.id,
       kind: row.kind,
       note: row.note,
-      createdAt: row.createdAt,
+      createdAt: row.created_at,
       requesterId: row.requesterId,
       requesterName: row.requesterName,
       taskId: row.taskId,
       taskTitle: row.taskTitle,
       taskStatus: row.taskStatus,
       assigneeName: row.assigneeName,
-      canAnswer: req.auth.isAdmin || (canHandleRequest(req.auth, row) && row.requesterId !== req.auth.id),
-    }));
+      canAnswer: req.auth.isAdmin || (await canHandleRequest(req.auth, row) && row.requesterId !== req.auth.id),
+    });
+  }
   res.json({ requests });
-});
+}));
 
-app.post('/api/requests/:id/decline', requireAuth, (req, res) => {
-  const row = db.prepare(`
-    SELECT r.*, t.assignee_id, t.creator_id, t.title, t.project_id
-    FROM task_requests r JOIN tasks t ON t.id = r.task_id
-    WHERE r.id = ?
-  `).get(req.params.id);
-  if (!row || row.status !== 'open') return bad(res, 404, 'Request not found');
-  if (!canHandleRequest(req.auth, row)) return bad(res, 403, 'Only the team lead can answer this');
+app.post('/api/requests/:id/decline', requireAuth, wrap(async (req, res) => {
+  const request = await findOne('task_requests', { _id: req.params.id });
+  const task = request ? await findOne('tasks', { _id: request.task_id }) : null;
+  if (!request || !task || request.status !== 'open') return bad(res, 404, 'Request not found');
+  const row = { ...request, assignee_id: task.assignee_id, creator_id: task.creator_id, title: task.title, project_id: task.project_id };
+  if (!await canHandleRequest(req.auth, row)) return bad(res, 403, 'Only the team lead can answer this');
   const note = readText(req.body.note, 500, 'a note');
   if (note.error) return bad(res, 400, note.error);
-  db.prepare(`UPDATE task_requests SET status = 'declined', response_note = ? WHERE id = ?`).run(note.value, row.id);
+  await updateOne('task_requests', { _id: row.id }, { status: 'declined', response_note: note.value });
   const label = row.kind === 'remove' ? 'remove' : 'review';
   const message = note.value
     ? `${req.auth.name} declined the request to ${label} “${row.title}”. Note: ${note.value}`
     : `${req.auth.name} declined the request to ${label} “${row.title}”.`;
-  notify(row.requester_id, message, row.task_id, row.project_id, 'requests');
-  logActivity(req.auth.id, message, row.task_id, row.project_id);
+  await notify(row.requester_id, message, row.task_id, row.project_id, 'requests');
+  await logActivity(req.auth.id, message, row.task_id, row.project_id);
   res.json({ ok: true });
-});
+}));
 
-function departureCard(request) {
-  const departments = db.prepare(`
-    SELECT d.name FROM departments d
-    JOIN user_departments ud ON ud.department_id = d.id
-    WHERE ud.user_id = ? AND d.lead_id = ?
-    ORDER BY d.name
-  `).all(request.user_id, request.lead_id).map((item) => item.name);
-  const items = db.prepare(`
-    SELECT i.id, i.task_id, i.rule_id, i.department_ids,
-      t.title AS task_title, t.status AS task_status, tp.name AS task_project,
-      r.title AS rule_title, rp.name AS rule_project
-    FROM departure_items i
-    LEFT JOIN tasks t ON t.id = i.task_id
-    LEFT JOIN projects tp ON tp.id = t.project_id
-    LEFT JOIN recurring_rules r ON r.id = i.rule_id
-    LEFT JOIN projects rp ON rp.id = r.project_id
-    WHERE i.request_id = ? AND i.done = 0
-    ORDER BY COALESCE(t.title, r.title)
-  `).all(request.id);
-  const peopleFor = (departmentIds) => teammates(String(departmentIds || '').split(',').filter(Boolean), request.user_id);
+async function departureCard(request) {
+  const links = await findMany('user_departments', { user_id: request.user_id });
+  const departmentIds = links.map((link) => link.department_id);
+  const departments = departmentIds.length
+    ? await findMany('departments', { _id: { $in: departmentIds }, lead_id: request.lead_id })
+    : [];
+  const names = departments.map((department) => department.name).sort((left, right) => left.localeCompare(right));
+  const items = await findMany('departure_items', { request_id: request.id, done: 0 });
+  const tasks = items.some((item) => item.task_id)
+    ? await findMany('tasks', { _id: { $in: items.map((item) => item.task_id).filter(Boolean) } })
+    : [];
+  const rules = items.some((item) => item.rule_id)
+    ? await findMany('recurring_rules', { _id: { $in: items.map((item) => item.rule_id).filter(Boolean) } })
+    : [];
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  const ruleMap = new Map(rules.map((rule) => [rule.id, rule]));
+  const projectIds = [...new Set([...tasks, ...rules].map((item) => item.project_id).filter(Boolean))];
+  const projects = projectIds.length ? await findMany('projects', { _id: { $in: projectIds } }) : [];
+  const projectMap = new Map(projects.map((project) => [project.id, project]));
+  const rows = items.map((item) => {
+    const task = item.task_id ? taskMap.get(item.task_id) : null;
+    const rule = item.rule_id ? ruleMap.get(item.rule_id) : null;
+    return {
+      ...item,
+      task_title: task?.title || null,
+      task_status: task?.status || null,
+      task_project: task?.project_id ? (projectMap.get(task.project_id)?.name || null) : null,
+      rule_title: rule?.title || null,
+      rule_project: rule?.project_id ? (projectMap.get(rule.project_id)?.name || null) : null,
+      label: task?.title || rule?.title || '',
+    };
+  }).sort((left, right) => left.label.localeCompare(right.label));
+  const taskCards = [];
+  const ruleCards = [];
+  for (const item of rows) {
+    const people = await teammates(String(item.department_ids || '').split(',').filter(Boolean), request.user_id);
+    if (item.task_id) {
+      taskCards.push({ id: item.task_id, title: item.task_title, status: item.task_status, projectName: item.task_project, people });
+    }
+    if (item.rule_id) {
+      ruleCards.push({ id: item.rule_id, title: item.rule_title, projectName: item.rule_project, people });
+    }
+  }
   return {
     id: request.id,
     userId: request.user_id,
     userName: request.user_name,
-    departments,
-    tasks: items.filter((item) => item.task_id).map((item) => ({
-      id: item.task_id,
-      title: item.task_title,
-      status: item.task_status,
-      projectName: item.task_project,
-      people: peopleFor(item.department_ids),
-    })),
-    rules: items.filter((item) => item.rule_id).map((item) => ({
-      id: item.rule_id,
-      title: item.rule_title,
-      projectName: item.rule_project,
-      people: peopleFor(item.department_ids),
-    })),
+    departments: names,
+    tasks: taskCards,
+    rules: ruleCards,
   };
 }
 
-app.get('/api/departures', requireAuth, (req, res) => {
-  const rows = db.prepare(`
-    SELECT d.*, u.name AS user_name
-    FROM departure_requests d
-    JOIN users u ON u.id = d.user_id
-    WHERE d.lead_id = ? AND d.status = 'open'
-    ORDER BY d.created_at
-  `).all(req.auth.id);
-  const departures = rows.map((row) => departureCard(row));
+app.get('/api/departures', requireAuth, wrap(async (req, res) => {
+  const rows = (await findMany('departure_requests', { lead_id: req.auth.id, status: 'open' }))
+    .sort((left, right) => left.created_at.localeCompare(right.created_at));
+  const users = await usersByIds(rows.map((row) => row.user_id));
+  const departures = [];
+  for (const row of rows) {
+    const user = users.get(row.user_id);
+    if (!user) continue;
+    departures.push(await departureCard({ ...row, user_name: user.name }));
+  }
   res.json({ departures });
-});
+}));
 
-app.post('/api/departures/:id/move', requireAuth, (req, res) => {
-  const request = db.prepare(`
-    SELECT d.*, u.name AS user_name
-    FROM departure_requests d
-    JOIN users u ON u.id = d.user_id
-    WHERE d.id = ?
-  `).get(req.params.id);
-  if (!request || request.status !== 'open') return bad(res, 404, 'Request not found');
+app.post('/api/departures/:id/move', requireAuth, wrap(async (req, res) => {
+  const request = await findOne('departure_requests', { _id: req.params.id });
+  const person = request ? await findOne('users', { _id: request.user_id }) : null;
+  if (!request || !person || request.status !== 'open') return bad(res, 404, 'Request not found');
   if (request.lead_id !== req.auth.id) return bad(res, 403, 'Only that team lead can move these tasks');
-  const person = db.prepare('SELECT * FROM users WHERE id = ?').get(request.user_id);
-  if (!person) return bad(res, 404, 'Person not found');
   const chosenTasks = Array.isArray(req.body.tasks) ? req.body.tasks : [];
   const chosenRules = Array.isArray(req.body.rules) ? req.body.rules : [];
   try {
-    const result = db.transaction(() => {
-      const items = db.prepare(`
-        SELECT * FROM departure_items WHERE request_id = ? AND done = 0
-      `).all(request.id);
+    const result = await withTx(async () => {
+      const items = await findMany('departure_items', { request_id: request.id, done: 0 });
       for (const item of items) {
         if (item.task_id) {
           const chosen = chosenTasks.find((entry) => entry.id === item.task_id);
           if (!chosen) throw httpError(400, 'Choose someone on your team for each task');
-          const assignee = assertTeammate(chosen.assigneeId, item.department_ids, person.id);
-          const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(item.task_id);
-          if (task) moveDepartureTask(task, assignee, person, req.auth);
+          const assignee = await assertTeammate(chosen.assigneeId, item.department_ids, person.id);
+          const task = await findOne('tasks', { _id: item.task_id });
+          if (task) await moveDepartureTask(task, assignee, person, req.auth);
         }
         if (item.rule_id) {
           const chosen = chosenRules.find((entry) => entry.id === item.rule_id);
           if (!chosen) throw httpError(400, 'Choose someone on your team for each repeating task');
-          const assignee = assertTeammate(chosen.assigneeId, item.department_ids, person.id);
-          const rule = db.prepare('SELECT * FROM recurring_rules WHERE id = ?').get(item.rule_id);
+          const assignee = await assertTeammate(chosen.assigneeId, item.department_ids, person.id);
+          const rule = await findOne('recurring_rules', { _id: item.rule_id });
           if (rule) {
             const changed = rule.assignee_id !== assignee.id;
-            db.prepare('UPDATE recurring_rules SET assignee_id = ? WHERE id = ?').run(assignee.id, rule.id);
-            db.prepare(`
-              UPDATE tasks SET assignee_id = ?, updated_at = ?
-              WHERE recurring_rule_id = ? AND status != 'done'
-            `).run(assignee.id, now(), rule.id);
+            await updateOne('recurring_rules', { _id: rule.id }, { assignee_id: assignee.id });
+            await updateMany('tasks', { recurring_rule_id: rule.id, status: { $ne: 'done' } }, { assignee_id: assignee.id, updated_at: now() });
             if (rule.project_id) {
-              db.prepare('INSERT OR IGNORE INTO project_members (project_id, user_id) VALUES (?, ?)').run(rule.project_id, assignee.id);
+              await insertIgnore('project_members', {
+                _id: `${rule.project_id}:${assignee.id}`,
+                project_id: rule.project_id,
+                user_id: assignee.id,
+              });
             }
             if (changed) {
-              notify(assignee.id, `${req.auth.name} set the repeating task “${rule.title}” for you.`, null, rule.project_id, 'repeating');
-              logActivity(req.auth.id, `${req.auth.name} moved the repeating task “${rule.title}” from ${person.name} to ${assignee.name}.`, null, rule.project_id);
+              await notify(assignee.id, `${req.auth.name} set the repeating task “${rule.title}” for you.`, null, rule.project_id, 'repeating');
+              await logActivity(req.auth.id, `${req.auth.name} moved the repeating task “${rule.title}” from ${person.name} to ${assignee.name}.`, null, rule.project_id);
             }
           }
         }
-        db.prepare('UPDATE departure_items SET done = 1 WHERE id = ?').run(item.id);
+        await updateOne('departure_items', { _id: item.id }, { done: 1 });
       }
-      db.prepare(`UPDATE departure_requests SET status = 'done' WHERE id = ?`).run(request.id);
+      await updateOne('departure_requests', { _id: request.id }, { status: 'done' });
       return maybeFinishDeparture(person.id, req.auth);
-    })();
+    });
     res.json({ ok: true, ...result });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
     throw error;
   }
-});
+}));
 
-const RULE_SQL = `
-SELECT r.id, r.title, r.description, r.cadence, r.weekday, r.priority, r.assignee_id, r.created_by,
-  r.project_id, r.active, r.created_at,
-  u.name AS assignee_name, c.name AS creator_name, p.name AS project_name
-FROM recurring_rules r
-JOIN users u ON u.id = r.assignee_id
-JOIN users c ON c.id = r.created_by
-LEFT JOIN projects p ON p.id = r.project_id
-`;
+app.get('/api/recurring', requireAuth, wrap(async (req, res) => {
+  const rules = await hydrateRules(await findMany('recurring_rules', {}));
+  const allowed = [];
+  for (const rule of rules) if (await canTouchRule(req.auth, rule)) allowed.push(rule);
+  allowed.sort((left, right) => right.active - left.active || left.assignee_name.localeCompare(right.assignee_name) || left.title.localeCompare(right.title));
+  res.json({ rules: allowed.map(mapRule) });
+}));
 
-app.get('/api/recurring', requireAuth, (req, res) => {
-  const rules = db.prepare(`${RULE_SQL} ORDER BY r.active DESC, u.name, r.title`).all();
-  res.json({ rules: rules.filter((rule) => canTouchRule(req.auth, rule)).map(mapRule) });
-});
-
-app.post('/api/recurring', requireAuth, (req, res) => {
+app.post('/api/recurring', requireAuth, wrap(async (req, res) => {
   const title = readText(req.body.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
   const description = readText(req.body.description, 4000, 'the description');
@@ -1758,35 +1942,43 @@ app.post('/api/recurring', requireAuth, (req, res) => {
   }
   const priority = PRIORITIES.has(req.body.priority) ? req.body.priority : 'medium';
   const assigneeId = req.body.assigneeId || req.auth.id;
-  if (!req.auth.isAdmin && assigneeId !== req.auth.id && !assigneeInLeadDepts(req.auth, assigneeId)) {
+  if (!req.auth.isAdmin && assigneeId !== req.auth.id && !await assigneeInLeadDepts(req.auth, assigneeId)) {
     return bad(res, 403, 'You can add repeating tasks for yourself. Team leads can add them for their department.');
   }
-  const assignee = activeUser(assigneeId);
+  const assignee = await activeUser(assigneeId);
   if (!assignee) return bad(res, 400, 'Choose an active person');
   const projectId = req.body.projectId || null;
   if (projectId) {
-    const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(projectId);
+    const project = await findOne('projects', { _id: projectId });
     if (!project) return bad(res, 400, 'That project does not exist');
     if (project.status === 'done') return bad(res, 400, 'That project is marked done');
-    if (!isProjectMember(projectId, assigneeId)) return bad(res, 400, 'That person is not on the project');
+    if (!await isProjectMember(projectId, assigneeId)) return bad(res, 400, 'That person is not on the project');
   }
   const ruleId = id('rule');
-  db.prepare(`
-    INSERT INTO recurring_rules (
-      id, title, description, cadence, weekday, priority, assignee_id, created_by, project_id, active, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-  `).run(ruleId, title.value, description.value, cadence, weekday, priority, assigneeId, req.auth.id, projectId, now());
-  logActivity(req.auth.id, `${req.auth.name} set “${title.value}” to repeat.`, null, projectId);
-  if (assigneeId !== req.auth.id) notify(assigneeId, `${req.auth.name} set a repeating task for you: “${title.value}”.`, null, projectId, 'repeating');
-  refreshRecurring();
-  const rule = db.prepare(`${RULE_SQL} WHERE r.id = ?`).get(ruleId);
+  await insertOne('recurring_rules', {
+    id: ruleId,
+    title: title.value,
+    description: description.value,
+    cadence,
+    weekday,
+    priority,
+    assignee_id: assigneeId,
+    created_by: req.auth.id,
+    project_id: projectId,
+    active: 1,
+    created_at: now(),
+  });
+  await logActivity(req.auth.id, `${req.auth.name} set “${title.value}” to repeat.`, null, projectId);
+  if (assigneeId !== req.auth.id) await notify(assigneeId, `${req.auth.name} set a repeating task for you: “${title.value}”.`, null, projectId, 'repeating');
+  await prepareWeek();
+  const [rule] = await hydrateRules([await findOne('recurring_rules', { _id: ruleId })]);
   res.status(201).json({ rule: mapRule(rule) });
-});
+}));
 
-app.patch('/api/recurring/:id', requireAuth, (req, res) => {
-  const rule = db.prepare('SELECT * FROM recurring_rules WHERE id = ?').get(req.params.id);
+app.patch('/api/recurring/:id', requireAuth, wrap(async (req, res) => {
+  const rule = await findOne('recurring_rules', { _id: req.params.id });
   if (!rule) return bad(res, 404, 'Repeating task not found');
-  if (!canTouchRule(req.auth, rule)) return bad(res, 403, 'You can’t change this repeating task');
+  if (!await canTouchRule(req.auth, rule)) return bad(res, 403, 'You can’t change this repeating task');
   const title = readText(req.body.title ?? rule.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
   const description = readText(req.body.description ?? rule.description, 4000, 'the description');
@@ -1798,45 +1990,50 @@ app.patch('/api/recurring/:id', requireAuth, (req, res) => {
     return bad(res, 400, 'Choose a day, Monday through Saturday');
   }
   const priority = PRIORITIES.has(req.body.priority) ? req.body.priority : rule.priority;
-  let assigneeId = req.body.assigneeId ?? rule.assignee_id;
-  if (assigneeId !== rule.assignee_id && !req.auth.isAdmin && !assigneeInLeadDepts(req.auth, assigneeId)) {
+  const assigneeId = req.body.assigneeId ?? rule.assignee_id;
+  if (assigneeId !== rule.assignee_id && !req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, assigneeId)) {
     return bad(res, 403, 'Only an admin or team lead can change who this repeats for');
   }
-  if (!activeUser(assigneeId)) return bad(res, 400, 'Choose an active person');
-  let projectId = req.body.projectId === undefined ? rule.project_id : (req.body.projectId || null);
-  if (projectId && !isProjectMember(projectId, assigneeId)) return bad(res, 400, 'That person is not on the project');
+  if (!await activeUser(assigneeId)) return bad(res, 400, 'Choose an active person');
+  const projectId = req.body.projectId === undefined ? rule.project_id : (req.body.projectId || null);
+  if (projectId && !await isProjectMember(projectId, assigneeId)) return bad(res, 400, 'That person is not on the project');
   const active = req.body.active === undefined ? rule.active : (req.body.active ? 1 : 0);
-  db.prepare(`
-    UPDATE recurring_rules
-    SET title = ?, description = ?, cadence = ?, weekday = ?, priority = ?, assignee_id = ?, project_id = ?, active = ?
-    WHERE id = ?
-  `).run(title.value, description.value, cadence, weekday, priority, assigneeId, projectId, active, rule.id);
-  refreshRecurring();
-  res.json({ rule: mapRule(db.prepare(`${RULE_SQL} WHERE r.id = ?`).get(rule.id)) });
-});
+  await updateOne('recurring_rules', { _id: rule.id }, {
+    title: title.value,
+    description: description.value,
+    cadence,
+    weekday,
+    priority,
+    assignee_id: assigneeId,
+    project_id: projectId,
+    active,
+  });
+  await prepareWeek();
+  const [fresh] = await hydrateRules([await findOne('recurring_rules', { _id: rule.id })]);
+  res.json({ rule: mapRule(fresh) });
+}));
 
-app.delete('/api/recurring/:id', requireAuth, (req, res) => {
-  const rule = db.prepare('SELECT * FROM recurring_rules WHERE id = ?').get(req.params.id);
+app.delete('/api/recurring/:id', requireAuth, wrap(async (req, res) => {
+  const rule = await findOne('recurring_rules', { _id: req.params.id });
   if (!rule) return bad(res, 404, 'Repeating task not found');
-  if (!canTouchRule(req.auth, rule)) return bad(res, 403, 'You can’t change this repeating task');
-  db.prepare('DELETE FROM recurring_rules WHERE id = ?').run(rule.id);
-  logActivity(req.auth.id, `${req.auth.name} stopped the repeat “${rule.title}”. Future weeks will not add it.`);
+  if (!await canTouchRule(req.auth, rule)) return bad(res, 403, 'You can’t change this repeating task');
+  await updateMany('tasks', { recurring_rule_id: rule.id }, { recurring_rule_id: null });
+  await deleteMany('departure_items', { rule_id: rule.id });
+  await deleteOne('recurring_rules', { _id: rule.id });
+  await logActivity(req.auth.id, `${req.auth.name} stopped the repeat “${rule.title}”. Future weeks will not add it.`);
   res.json({ ok: true });
-});
+}));
 
-function hrUserIds() {
-  return db.prepare(`
-    SELECT DISTINCT u.id AS id
-    FROM users u
-    JOIN user_departments ud ON ud.user_id = u.id
-    JOIN departments d ON d.id = ud.department_id
-    WHERE u.active = 1 AND lower(d.name) = 'hr'
-    UNION
-    SELECT u.id AS id
-    FROM departments d
-    JOIN users u ON u.id = d.lead_id
-    WHERE u.active = 1 AND lower(d.name) = 'hr' AND d.lead_id IS NOT NULL
-  `).all().map((row) => row.id);
+async function hrUserIds() {
+  const departments = (await findMany('departments', {})).filter((department) => department.name.toLowerCase() === 'hr');
+  if (!departments.length) return [];
+  const departmentIds = departments.map((department) => department.id);
+  const links = await findMany('user_departments', { department_id: { $in: departmentIds } });
+  const ids = new Set(links.map((link) => link.user_id));
+  for (const department of departments) if (department.lead_id) ids.add(department.lead_id);
+  if (!ids.size) return [];
+  const users = await findMany('users', { _id: { $in: [...ids] }, active: 1 });
+  return users.map((user) => user.id);
 }
 
 function isHr(auth) {
@@ -1855,65 +2052,72 @@ function mapAttendance(row) {
   return { day: row.day, checkIn: row.check_in, checkOut: row.check_out };
 }
 
-app.get('/api/attendance/today', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT day, check_in, check_out FROM attendance WHERE user_id = ? AND day = ?').get(req.auth.id, todayISO());
+app.get('/api/attendance/today', requireAuth, wrap(async (req, res) => {
+  const row = await findOne('attendance', { user_id: req.auth.id, day: todayISO() });
   res.json({ record: mapAttendance(row) });
-});
+}));
 
-app.post('/api/attendance/check-in', requireAuth, (req, res) => {
+app.post('/api/attendance/check-in', requireAuth, wrap(async (req, res) => {
   const day = todayISO();
   if (weekdayMon1(day) === 7) return bad(res, 400, 'Sunday is off');
-  const existing = db.prepare('SELECT check_in FROM attendance WHERE user_id = ? AND day = ?').get(req.auth.id, day);
+  const existing = await findOne('attendance', { user_id: req.auth.id, day });
   if (existing?.check_in) return bad(res, 400, 'You already checked in today');
   const stamp = now();
   if (existing) {
-    db.prepare('UPDATE attendance SET check_in = ? WHERE user_id = ? AND day = ?').run(stamp, req.auth.id, day);
+    await updateOne('attendance', { _id: existing.id }, { check_in: stamp });
   } else {
-    db.prepare('INSERT INTO attendance (id, user_id, day, check_in, check_out) VALUES (?, ?, ?, ?, NULL)').run(id('att'), req.auth.id, day, stamp);
+    await insertOne('attendance', { id: id('att'), user_id: req.auth.id, day, check_in: stamp, check_out: null });
   }
-  res.status(201).json({ record: mapAttendance(db.prepare('SELECT day, check_in, check_out FROM attendance WHERE user_id = ? AND day = ?').get(req.auth.id, day)) });
-});
+  res.status(201).json({ record: mapAttendance(await findOne('attendance', { user_id: req.auth.id, day })) });
+}));
 
-app.post('/api/attendance/check-out', requireAuth, (req, res) => {
+app.post('/api/attendance/check-out', requireAuth, wrap(async (req, res) => {
   const day = todayISO();
   if (weekdayMon1(day) === 7) return bad(res, 400, 'Sunday is off');
-  const existing = db.prepare('SELECT check_in, check_out FROM attendance WHERE user_id = ? AND day = ?').get(req.auth.id, day);
+  const existing = await findOne('attendance', { user_id: req.auth.id, day });
   if (!existing?.check_in) return bad(res, 400, 'Check in before you check out');
   if (existing.check_out) return bad(res, 400, 'You already checked out today');
-  db.prepare('UPDATE attendance SET check_out = ? WHERE user_id = ? AND day = ?').run(now(), req.auth.id, day);
-  res.json({ record: mapAttendance(db.prepare('SELECT day, check_in, check_out FROM attendance WHERE user_id = ? AND day = ?').get(req.auth.id, day)) });
-});
+  await updateOne('attendance', { _id: existing.id }, { check_out: now() });
+  res.json({ record: mapAttendance(await findOne('attendance', { user_id: req.auth.id, day })) });
+}));
 
-app.get('/api/attendance', requireAuth, (req, res) => {
+app.get('/api/attendance', requireAuth, wrap(async (req, res) => {
   const month = String(req.query.month || '');
   if (!/^\d{4}-\d{2}$/.test(month)) return bad(res, 400, 'Choose a month');
   const userId = req.query.userId || req.auth.id;
-  if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(userId)) return bad(res, 404, 'Person not found');
-  if (userId !== req.auth.id && !req.auth.isAdmin && !assigneeInLeadDepts(req.auth, userId)) {
+  if (!await exists('users', { _id: userId })) return bad(res, 404, 'Person not found');
+  if (userId !== req.auth.id && !req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, userId)) {
     return bad(res, 403, 'You can open attendance for people on a team you lead');
   }
   const { start, end } = monthBounds(month);
-  const records = db.prepare(`
-    SELECT day, check_in, check_out FROM attendance
-    WHERE user_id = ? AND day >= ? AND day <= ?
-    ORDER BY day
-  `).all(userId, start, end).map(mapAttendance);
-  const dates = db.prepare('SELECT birthday, work_anniversary AS workAnniversary FROM users WHERE id = ?').get(userId);
-  res.json({ month, userId, records, birthday: dates?.birthday || null, workAnniversary: dates?.workAnniversary || null });
-});
+  const records = (await findMany('attendance', { user_id: userId, day: { $gte: start, $lte: end } }))
+    .sort((left, right) => left.day.localeCompare(right.day))
+    .map(mapAttendance);
+  const dates = await findOne('users', { _id: userId });
+  res.json({ month, userId, records, birthday: dates?.birthday || null, workAnniversary: dates?.work_anniversary || null });
+}));
 
-app.get('/api/chores', requireAuth, (req, res) => {
-  const chores = db.prepare(`
-    SELECT c.id, c.category, c.title, c.details, c.status, c.created_at AS createdAt,
-      c.requester_id AS requesterId, u.name AS requesterName
-    FROM office_chores c
-    JOIN users u ON u.id = c.requester_id
-    ORDER BY c.created_at DESC
-  `).all();
+app.get('/api/chores', requireAuth, wrap(async (req, res) => {
+  const rows = (await findMany('office_chores', {})).sort((left, right) => right.created_at.localeCompare(left.created_at));
+  const users = await usersByIds(rows.map((row) => row.requester_id));
+  const chores = rows.flatMap((row) => {
+    const requester = users.get(row.requester_id);
+    if (!requester) return [];
+    return [{
+      id: row.id,
+      category: row.category,
+      title: row.title,
+      details: row.details,
+      status: row.status,
+      createdAt: row.created_at,
+      requesterId: row.requester_id,
+      requesterName: requester.name,
+    }];
+  });
   res.json({ chores, canClose: isHr(req.auth) });
-});
+}));
 
-app.post('/api/chores', requireAuth, (req, res) => {
+app.post('/api/chores', requireAuth, wrap(async (req, res) => {
   const category = req.body.category === 'purchasing' ? 'purchasing' : req.body.category === 'maintenance' ? 'maintenance' : '';
   if (!category) return bad(res, 400, 'Choose maintenance or purchasing');
   const title = readText(req.body.title, 140, 'what is needed', true);
@@ -1921,87 +2125,110 @@ app.post('/api/chores', requireAuth, (req, res) => {
   const details = readText(req.body.details, 2000, 'the details');
   if (details.error) return bad(res, 400, details.error);
   const choreId = id('chr');
-  db.prepare(`
-    INSERT INTO office_chores (id, category, title, details, requester_id, status, created_at)
-    VALUES (?, ?, ?, ?, ?, 'open', ?)
-  `).run(choreId, category, title.value, details.value, req.auth.id, now());
+  await insertOne('office_chores', {
+    id: choreId,
+    category,
+    title: title.value,
+    details: details.value,
+    requester_id: req.auth.id,
+    status: 'open',
+    created_at: now(),
+  });
   const label = category === 'purchasing' ? 'Purchasing' : 'Maintenance';
-  for (const userId of hrUserIds()) {
+  for (const userId of await hrUserIds()) {
     if (userId !== req.auth.id) {
-      notify(userId, `${req.auth.name} raised a ${label.toLowerCase()} request: “${title.value}”.`, null, null, 'chores');
+      await notify(userId, `${req.auth.name} raised a ${label.toLowerCase()} request: “${title.value}”.`, null, null, 'chores');
     }
   }
-  logActivity(req.auth.id, `${req.auth.name} raised “${title.value}” for ${label.toLowerCase()}.`);
+  await logActivity(req.auth.id, `${req.auth.name} raised “${title.value}” for ${label.toLowerCase()}.`);
   res.status(201).json({ ok: true });
-});
+}));
 
-app.post('/api/chores/:id/done', requireAuth, (req, res) => {
+app.post('/api/chores/:id/done', requireAuth, wrap(async (req, res) => {
   if (!isHr(req.auth)) return bad(res, 403, 'HR marks office requests done');
-  const chore = db.prepare('SELECT * FROM office_chores WHERE id = ?').get(req.params.id);
+  const chore = await findOne('office_chores', { _id: req.params.id });
   if (!chore) return bad(res, 404, 'Request not found');
   if (chore.status !== 'done') {
-    db.prepare(`UPDATE office_chores SET status = 'done' WHERE id = ?`).run(chore.id);
+    await updateOne('office_chores', { _id: chore.id }, { status: 'done' });
     if (chore.requester_id !== req.auth.id) {
-      notify(chore.requester_id, `${req.auth.name} marked “${chore.title}” done.`, null, null, 'chores');
+      await notify(chore.requester_id, `${req.auth.name} marked “${chore.title}” done.`, null, null, 'chores');
     }
   }
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/notifications', requireAuth, (req, res) => {
-  const notifications = db.prepare(`
-    SELECT id, message, task_id AS taskId, project_id AS projectId, area, read, created_at AS createdAt
-    FROM notifications WHERE user_id = ?
-    ORDER BY created_at DESC LIMIT 40
-  `).all(req.auth.id).map((item) => ({ ...item, read: Boolean(item.read) }));
-  const unreadCount = db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read = 0').get(req.auth.id).n;
+app.get('/api/notifications', requireAuth, wrap(async (req, res) => {
+  const notifications = (await findMany('notifications', { user_id: req.auth.id }, { sort: { created_at: -1 }, limit: 40 }))
+    .map((item) => ({
+      id: item.id,
+      message: item.message,
+      taskId: item.task_id,
+      projectId: item.project_id,
+      area: item.area,
+      read: Boolean(item.read),
+      createdAt: item.created_at,
+    }));
+  const unreadCount = await count('notifications', { user_id: req.auth.id, read: 0 });
+  const grouped = await aggregate('notifications', [
+    { $match: { user_id: req.auth.id, area_seen: 0, area: { $ne: null } } },
+    { $group: { _id: '$area', n: { $sum: 1 } } },
+    { $project: { _id: 0, area: '$_id', n: 1 } },
+  ]);
   const areas = {};
-  for (const row of db.prepare(`
-    SELECT area, COUNT(*) AS n FROM notifications
-    WHERE user_id = ? AND area_seen = 0 AND area IS NOT NULL
-    GROUP BY area
-  `).all(req.auth.id)) {
-    areas[row.area] = row.n;
-  }
+  for (const row of grouped) areas[row.area] = row.n;
   res.json({ notifications, unreadCount, areas });
-});
+}));
 
-app.post('/api/notifications/seen', requireAuth, (req, res) => {
+app.post('/api/notifications/seen', requireAuth, wrap(async (req, res) => {
   const area = String(req.body.area || '');
   if (!/^[a-z]+$/.test(area)) return bad(res, 400, 'Choose a section');
-  db.prepare('UPDATE notifications SET area_seen = 1 WHERE user_id = ? AND area = ?').run(req.auth.id, area);
+  await updateMany('notifications', { user_id: req.auth.id, area }, { area_seen: 1 });
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/notifications/read', requireAuth, (req, res) => {
+app.post('/api/notifications/read', requireAuth, wrap(async (req, res) => {
   if (req.body.all) {
-    db.prepare('UPDATE notifications SET read = 1 WHERE user_id = ?').run(req.auth.id);
+    await updateMany('notifications', { user_id: req.auth.id }, { read: 1 });
   } else if (Array.isArray(req.body.ids) && req.body.ids.length) {
     const ids = req.body.ids.slice(0, 100);
-    const marks = ids.map(() => '?').join(',');
-    db.prepare(`UPDATE notifications SET read = 1 WHERE user_id = ? AND id IN (${marks})`).run(req.auth.id, ...ids);
+    await updateMany('notifications', { user_id: req.auth.id, _id: { $in: ids } }, { read: 1 });
   }
   res.json({ ok: true });
-});
+}));
 
-app.get('/api/activity', requireAuth, (req, res) => {
-  const events = req.auth.isAdmin || req.auth.isLead
-    ? db.prepare(`
-        SELECT a.id, a.message, a.task_id AS taskId, a.project_id AS projectId, a.created_at AS createdAt, u.name AS actorName
-        FROM activity a JOIN users u ON u.id = a.actor_id
-        ORDER BY a.created_at DESC LIMIT 200
-      `).all()
-    : db.prepare(`
-        SELECT DISTINCT a.id, a.message, a.task_id AS taskId, a.project_id AS projectId, a.created_at AS createdAt, u.name AS actorName
-        FROM activity a
-        JOIN users u ON u.id = a.actor_id
-        LEFT JOIN tasks t ON t.id = a.task_id
-        LEFT JOIN project_members pm ON pm.project_id = a.project_id AND pm.user_id = ?
-        WHERE a.actor_id = ? OR t.assignee_id = ? OR t.creator_id = ? OR pm.user_id IS NOT NULL
-        ORDER BY createdAt DESC LIMIT 200
-      `).all(req.auth.id, req.auth.id, req.auth.id, req.auth.id);
-  res.json({ events });
-});
+app.get('/api/activity', requireAuth, wrap(async (req, res) => {
+  let events;
+  if (req.auth.isAdmin || req.auth.isLead) {
+    events = await findMany('activity', {}, { sort: { created_at: -1 }, limit: 200 });
+  } else {
+    const [memberships, tasks] = await Promise.all([
+      findMany('project_members', { user_id: req.auth.id }),
+      findMany('tasks', { $or: [{ assignee_id: req.auth.id }, { creator_id: req.auth.id }] }),
+    ]);
+    events = await findMany('activity', {
+      $or: [
+        { actor_id: req.auth.id },
+        { task_id: { $in: tasks.map((task) => task.id) } },
+        { project_id: { $in: memberships.map((link) => link.project_id) } },
+      ],
+    }, { sort: { created_at: -1 }, limit: 200 });
+  }
+  const actors = await usersByIds(events.map((event) => event.actor_id));
+  res.json({
+    events: events.flatMap((event) => {
+      const actor = actors.get(event.actor_id);
+      if (!actor) return [];
+      return [{
+        id: event.id,
+        message: event.message,
+        taskId: event.task_id,
+        projectId: event.project_id,
+        createdAt: event.created_at,
+        actorName: actor.name,
+      }];
+    }),
+  });
+}));
 
 registerSections(app, {
   requireAuth,
@@ -2017,6 +2244,7 @@ registerSections(app, {
   maybeFinishDeparture,
   isISODate,
   uniqueList,
+  wrap,
 });
 
 app.use('/api', (_req, res) => {
@@ -2036,17 +2264,80 @@ if (fs.existsSync(indexHtml)) {
 app.use((error, _req, res, _next) => {
   console.error(error);
   if (res.headersSent) return;
+  if (error?.code === 11000 || String(error?.message || '').includes('UNIQUE')) {
+    return res.status(400).json({ error: 'That value is already in use' });
+  }
   res.status(500).json({ error: 'Something went wrong' });
 });
 
-const officeAddresses = lanAddresses();
-if (officeAddresses[0]) publishOfficeName(officeAddresses[0]);
+async function bootstrapAdmin() {
+  if (await count('users')) return;
+  const email = String(process.env.BOOTSTRAP_ADMIN_EMAIL || '').trim().toLowerCase();
+  const password = String(process.env.BOOTSTRAP_ADMIN_PASSWORD || '');
+  const name = process.env.BOOTSTRAP_ADMIN_NAME || 'Admin';
+  if (!email || password.length < 8) {
+    console.error('BOOTSTRAP_ADMIN_EMAIL and a password of at least 8 characters are required to create the first admin.');
+    return;
+  }
+  await insertOne('users', {
+    id: id('usr'),
+    name,
+    email,
+    password_hash: bcrypt.hashSync(password, 10),
+    role: 'admin',
+    active: 1,
+    birthday: null,
+    work_anniversary: null,
+    created_at: now(),
+  });
+  console.log(`Created the first admin ${email}.`);
+}
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Kanabana API listening on ${PORT}`);
-  if (!officeAddresses.length) return;
-  console.log(`On this Wi-Fi, open http://kanabana.local:5173`);
-  console.log(`Office API is http://${officeAddresses[0]}:${PORT}`);
+async function main() {
+  if (!process.env.MONGODB_URI) {
+    console.error('Set MONGODB_URI. The Atlas, Compass, and Docker steps are in DEPLOY.md.');
+    process.exit(1);
+  }
+  if (process.env.NODE_ENV === 'production' && (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'kanabana-dev-secret')) {
+    console.error('Set JWT_SECRET to a long random string before starting in production.');
+    process.exit(1);
+  }
+  let connected = false;
+  for (let attempt = 1; attempt <= 30; attempt += 1) {
+    try {
+      await connectDb();
+      connected = true;
+      break;
+    } catch (error) {
+      console.error(`Waiting for MongoDB (${attempt}/30): ${error.message}`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2000 * attempt, 10_000)));
+    }
+  }
+  if (!connected) process.exit(1);
+  await ensureIndexes();
+  await repairData();
+  if (process.env.SEED_DEMO === '1') await seedIfEmpty();
+  else if (process.env.BOOTSTRAP_ADMIN_EMAIL) await bootstrapAdmin();
+  await prepareWeek();
+  const officeAddresses = lanAddresses();
+  if (officeAddresses[0]) publishOfficeName(officeAddresses[0]);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Kanabana API listening on ${PORT}`);
+    console.log(`MongoDB database “${databaseName()}”`);
+    if (!officeAddresses.length) return;
+    console.log('On this Wi-Fi, open http://kanabana.local:5173');
+    console.log(`Office API is http://${officeAddresses[0]}:${PORT}`);
+  });
+  const shutdown = async () => {
+    server.close();
+    await closeDb();
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => { shutdown(); });
+  process.on('SIGINT', () => { shutdown(); });
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
 });
-
-
