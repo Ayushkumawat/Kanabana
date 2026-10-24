@@ -2064,11 +2064,14 @@ app.post('/api/requests/:id/decline', requireAuth, wrap(async (req, res) => {
   const note = readText(req.body.note, 500, 'a note');
   if (note.error) return bad(res, 400, note.error);
   await updateOne('task_requests', { _id: row.id }, { status: 'declined', response_note: note.value, resolved_at: now() });
+  const sentBack = request.kind === 'review' && task.status === 'review';
+  if (sentBack) await writeStatus(task.id, 'upcoming', task.completed_at);
   const label = requestVerb(row.kind);
-  const message = note.value
+  const base = note.value
     ? `${req.auth.name} declined the request to ${label} “${row.title}”. Note: ${note.value}`
     : `${req.auth.name} declined the request to ${label} “${row.title}”.`;
-  await notify(row.requester_id, message, row.task_id, row.project_id, 'requests');
+  const message = sentBack ? `${base} It’s back on your To do.` : base;
+  await notify(row.requester_id, message, row.task_id, row.project_id, sentBack ? 'board' : 'requests');
   await logActivity(req.auth.id, message, row.task_id, row.project_id);
   res.json({ ok: true });
 }));

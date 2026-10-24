@@ -10,6 +10,9 @@ const FILTERS = [
   { id: 'all', label: 'All' },
   { id: 'closed', label: 'Closed' },
   { id: 'completion', label: 'Task completion' },
+  { id: 'editing', label: 'Task editing' },
+  { id: 'others', label: 'Others' },
+  { id: 'declined', label: 'Declined' },
 ];
 
 function requestTitle(request) {
@@ -28,6 +31,9 @@ function outcome(request) {
 
 function matches(request, filter) {
   if (filter === 'completion') return request.kind === 'review';
+  if (filter === 'editing') return request.kind === 'edit';
+  if (filter === 'others') return request.kind !== 'review' && request.kind !== 'edit';
+  if (filter === 'declined') return request.status === 'declined';
   if (filter === 'all') return true;
   if (filter === 'closed') return request.status !== 'open';
   return request.status === 'open';
@@ -70,7 +76,7 @@ export default function Requests() {
         accept: 'Edit request closed',
         done: 'Marked done',
       };
-      toast(done[action]);
+      toast(action === 'decline' && request.kind === 'review' ? 'Sent back to To do' : done[action]);
       setDeclineId('');
       setDeclineNote('');
       await load();
@@ -80,7 +86,7 @@ export default function Requests() {
   }
 
   const shown = requests.filter((request) => matches(request, filter));
-  const showDepartures = filter === 'open' || filter === 'all';
+  const showDepartures = filter === 'open' || filter === 'all' || filter === 'others';
   const empty = shown.length === 0 && (!showDepartures || departures.length === 0);
 
   return (
@@ -88,7 +94,7 @@ export default function Requests() {
       <div className="page-head">
         <div>
           <h1>Requests</h1>
-          <p className="lede">Open requests are listed first. All, Closed, and Task completion include ones already answered, with the note that was left.</p>
+          <p className="lede">Open requests are listed first. Task completion, Task editing, Others, and Declined narrow the list. Declining a completion request sends that task back to the person’s To do.</p>
         </div>
       </div>
       <div className="segment">
@@ -247,7 +253,7 @@ export default function Requests() {
                         act(request, 'decline', declineNote);
                       }}
                     >
-                      <Field label="Note for them" hint="Optional. They’ll still see this request after it’s closed, with this note.">
+                      <Field label="Note for them" hint={request.kind === 'review' ? 'Optional. The task goes back to their To do, and they keep this note on the request.' : 'Optional. They’ll still see this request after it’s closed, with this note.'}>
                         <textarea value={declineNote} onChange={(event) => setDeclineNote(event.target.value)} maxLength={500} placeholder="Why you’re sending this back" />
                       </Field>
                       <div className="actions">

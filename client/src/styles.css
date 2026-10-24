@@ -227,7 +227,7 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .kicker { text-transform: uppercase; letter-spacing: 0.08em; font-size: 12px; color: var(--muted); font-weight: 700; }
 .stack { display: grid; gap: 12px; }
 .toolbar { margin: 8px 0; }
-.segment { display: inline-flex; background: #fff; border-radius: 999px; padding: 4px; border: 1px solid var(--line); }
+.segment { display: flex; flex-wrap: wrap; width: fit-content; max-width: 100%; gap: 2px; background: #fff; border-radius: 18px; padding: 4px; border: 1px solid var(--line); }
 .segment button { border: 0; background: transparent; border-radius: 999px; padding: 7px 12px; font-weight: 600; }
 .segment button.on { background: var(--green); color: #fff; }
 .stats, .filters, .chips, .checks { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -452,8 +452,9 @@ textarea { min-height: 88px; resize: vertical; }
 }
 .feed-item { display: grid; gap: 2px; }
 .feed-item small { color: var(--muted); }
-.pick-list { display: grid; gap: 6px; max-height: 220px; overflow: auto; padding: 8px 10px; background: #fff; border: 1px solid var(--line); border-radius: 12px; }
-.pick-list label { display: flex; gap: 8px; align-items: center; }
+.pick-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px 16px; max-height: 240px; overflow: auto; padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: 12px; }
+.pick-list label { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.pick-list input { width: auto; flex: none; padding: 0; }
 .report-form { display: grid; gap: 12px; }
 .report-list { display: grid; }
 .report-card { display: grid; gap: 8px; padding: 14px 0; border-bottom: 1px solid var(--line); }
