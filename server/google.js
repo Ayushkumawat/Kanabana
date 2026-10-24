@@ -37,6 +37,28 @@ export function googleConnected() {
   return Boolean(clientId && clientSecret && refreshToken);
 }
 
+let readyUntil = 0;
+let readyValue = false;
+
+export async function googleReady() {
+  if (Date.now() < readyUntil) return readyValue;
+  if (!googleConnected()) {
+    readyValue = false;
+    readyUntil = Date.now() + 30 * 1000;
+    return false;
+  }
+  try {
+    await accessToken();
+    readyValue = true;
+    readyUntil = Date.now() + 10 * 60 * 1000;
+  } catch (error) {
+    console.error(error.message);
+    readyValue = false;
+    readyUntil = Date.now() + 30 * 1000;
+  }
+  return readyValue;
+}
+
 export function googleAuthUrl() {
   const { clientId, clientSecret } = credentials();
   if (!clientId || !clientSecret) {
@@ -81,6 +103,7 @@ export async function finishGoogleAuth(code, state) {
   fs.writeFileSync(tokenPath, JSON.stringify({ clientId, clientSecret, refreshToken: data.refresh_token }));
   process.env.GOOGLE_REFRESH_TOKEN = data.refresh_token;
   cached = null;
+  readyUntil = 0;
 }
 
 async function accessToken() {

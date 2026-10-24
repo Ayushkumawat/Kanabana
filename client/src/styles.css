@@ -455,6 +455,18 @@ textarea { min-height: 88px; resize: vertical; }
 .hire-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: start; }
 .hire-card { display: grid; gap: 8px; align-content: start; min-width: 0; padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: 14px; }
 .hire-card .btn { width: fit-content; }
+.replace-resume { position: relative; cursor: pointer; }
+.replace-resume input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 .hire-card .row-between { align-items: flex-start; }
 .hire-card .fields.two { grid-template-columns: 1fr; }
 .hire-card p { margin: 0; overflow-wrap: anywhere; }

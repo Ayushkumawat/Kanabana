@@ -41,7 +41,7 @@ import { lanAddresses, publishOfficeName } from './office.js';
 import { loadEnv } from './store.js';
 import { registerSections } from './sections.js';
 import { announcementPending } from './announcements.js';
-import { finishGoogleAuth, googleAuthUrl } from './google.js';
+import { finishGoogleAuth, googleAuthUrl, googleReady } from './google.js';
 import { checkMail, sendAssignmentEmail } from './mail.js';
 import { startReminders } from './reminders.js';
 
@@ -2636,6 +2636,7 @@ async function main() {
   else if (process.env.BOOTSTRAP_ADMIN_EMAIL) await bootstrapAdmin();
   await prepareWeek();
   await checkMail();
+  console.log(await googleReady() ? 'Google Calendar is connected' : 'Google Calendar is not connected');
   startReminders();
   const officeAddresses = lanAddresses();
   if (officeAddresses[0]) publishOfficeName(officeAddresses[0]);

@@ -1,7 +1,4 @@
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import {
   count,
@@ -22,63 +19,61 @@ import {
 } from './db.js';
 import { audienceUsers, mustAck } from './announcements.js';
 import { sendDependencyEmail } from './mail.js';
-import { createGoogleMeet, deleteGoogleEvent, googleConnected } from './google.js';
+import { createGoogleMeet, deleteGoogleEvent, googleReady } from './google.js';
 import { isTime, sendInvites } from './meetings.js';
+import { deleteStored, existsStored, putStored, readStored, safeKey } from './storage.js';
 
-const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'uploads');
 const fileTickets = new Map();
+const FILE_TYPES = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  txt: 'text/plain',
+  md: 'text/markdown',
+  zip: 'application/zip',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
 const ALLOWED = new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt', 'md', 'zip']);
 const ONBOARDING = ['Adding to Razorpay', 'Gate access', 'Document verification', 'System access'];
 const IMAGES = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
 
-function saveImage(file) {
+async function storeUpload(file, folder, allowed, limit, emptyMessage, typeMessage) {
   if (!file?.name || !file?.data) return null;
   const ext = String(file.name).split('.').pop().toLowerCase();
-  if (!IMAGES.has(ext)) {
-    const error = new Error('Use a png, jpg, webp, or gif screenshot');
+  if (!allowed.has(ext)) {
+    const error = new Error(typeMessage);
     error.status = 400;
     throw error;
   }
   const raw = Buffer.from(String(file.data), 'base64');
   if (!raw.length) {
-    const error = new Error('That screenshot was empty');
+    const error = new Error(emptyMessage);
     error.status = 400;
     throw error;
   }
-  if (raw.length > 3 * 1024 * 1024) {
-    const error = new Error('Keep each screenshot under 3 MB');
+  if (raw.length > limit) {
+    const error = new Error(limit > 3 * 1024 * 1024 ? 'Keep the file under 8 MB' : 'Keep each screenshot under 3 MB');
     error.status = 400;
     throw error;
   }
-  fs.mkdirSync(uploadDir, { recursive: true });
-  const stored = `${id('file')}.${ext}`;
-  fs.writeFileSync(path.join(uploadDir, stored), raw);
+  const stored = await putStored(folder, `${id('file')}.${ext}`, raw, FILE_TYPES[ext] || 'application/octet-stream');
   return { stored, name: String(file.name).slice(0, 180) };
 }
 
-function saveFile(file) {
-  if (!file?.name || !file?.data) return null;
-  const ext = String(file.name).split('.').pop().toLowerCase();
-  if (!ALLOWED.has(ext)) {
-    const error = new Error('Use a pdf, office, image, text, or zip file');
-    error.status = 400;
-    throw error;
-  }
-  const raw = Buffer.from(String(file.data), 'base64');
-  if (!raw.length) {
-    const error = new Error('That file was empty');
-    error.status = 400;
-    throw error;
-  }
-  if (raw.length > 8 * 1024 * 1024) {
-    const error = new Error('Keep the file under 8 MB');
-    error.status = 400;
-    throw error;
-  }
-  fs.mkdirSync(uploadDir, { recursive: true });
-  const stored = `${id('file')}.${ext}`;
-  fs.writeFileSync(path.join(uploadDir, stored), raw);
-  return { stored, name: String(file.name).slice(0, 180) };
+function saveImage(file) {
+  return storeUpload(file, 'reports', IMAGES, 3 * 1024 * 1024, 'That screenshot was empty', 'Use a png, jpg, webp, or gif screenshot');
+}
+
+function saveFile(file, folder) {
+  return storeUpload(file, folder, ALLOWED, 8 * 1024 * 1024, 'That file was empty', 'Use a pdf, office, image, text, or zip file');
 }
 
 function canOffice(auth) {
@@ -173,44 +168,51 @@ export function registerSections(app, ctx) {
     res.json({ notes: await notepadList(req.auth.id) });
   }));
 
-  function storedFile(req) {
-    const stored = path.basename(String(req.params.stored || ''));
-    const full = path.join(uploadDir, stored);
-    if (!stored || stored === '.' || stored === '..' || !fs.existsSync(full)) return null;
-    return { stored, full };
+  function requestedKey(req) {
+    return safeKey(req.params[0] || '');
   }
 
   function ticketMatches(req, stored) {
     const ticket = String(req.query.ticket || '');
     const row = ticket ? fileTickets.get(ticket) : null;
-    if (!row || row.stored !== stored || row.exp < Date.now()) return false;
-    return true;
+    return Boolean(row && row.stored === stored && row.exp >= Date.now());
   }
 
-  app.post('/api/files/:stored/ticket', requireAuth, (req, res) => {
-    const file = storedFile(req);
-    if (!file) return bad(res, 404, 'File not found');
-    const nowMs = Date.now();
-    for (const [key, row] of fileTickets) if (row.exp < nowMs) fileTickets.delete(key);
-    const ticket = crypto.randomBytes(24).toString('hex');
-    fileTickets.set(ticket, { stored: file.stored, exp: nowMs + 10 * 60 * 1000 });
-    res.json({ ticket });
-  });
-
-  app.get('/api/files/:stored', (req, res, next) => {
-    const file = storedFile(req);
-    if (ticketMatches(req, file?.stored)) return next();
-    return requireAuth(req, res, next);
-  }, (req, res) => {
-    const file = storedFile(req);
-    if (!file) return bad(res, 404, 'File not found');
-    if (String(req.query.inline || '') === '1') {
-      res.setHeader('Content-Disposition', 'inline');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      return res.sendFile(file.full);
+  app.post(/^\/api\/files\/(.+)\/ticket$/, requireAuth, wrap(async (req, res) => {
+    const key = requestedKey(req);
+    let found = '';
+    try {
+      found = key ? await existsStored(key) : '';
+    } catch (error) {
+      return bad(res, error.status || 502, error.message);
     }
-    res.download(file.full);
-  });
+    if (!found) return bad(res, 404, 'File not found');
+    const nowMs = Date.now();
+    for (const [ticket, row] of fileTickets) if (row.exp < nowMs) fileTickets.delete(ticket);
+    const ticket = crypto.randomBytes(24).toString('hex');
+    fileTickets.set(ticket, { stored: key, exp: nowMs + 10 * 60 * 1000 });
+    res.json({ ticket });
+  }));
+
+  app.get(/^\/api\/files\/(.+)$/, (req, res, next) => {
+    const key = requestedKey(req);
+    if (ticketMatches(req, key)) return next();
+    return requireAuth(req, res, next);
+  }, wrap(async (req, res) => {
+    const key = requestedKey(req);
+    let file = null;
+    try {
+      file = key ? await readStored(key) : null;
+    } catch (error) {
+      return bad(res, error.status || 502, error.message);
+    }
+    if (!file) return bad(res, 404, 'File not found');
+    const inline = String(req.query.inline || '') === '1';
+    res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', inline ? 'inline' : 'attachment');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(file.bytes);
+  }));
 
   app.get('/api/knowledge', requireAuth, wrap(async (req, res) => {
     const rows = (await findMany('knowledge_items', {})).sort((left, right) => right.created_at.localeCompare(left.created_at));
@@ -250,7 +252,7 @@ export function registerSections(app, ctx) {
     const link = String(req.body.link || '').trim();
     let file = null;
     try {
-      file = req.body.file ? saveFile(req.body.file) : null;
+      file = req.body.file ? await saveFile(req.body.file, 'knowledge') : null;
     } catch (error) {
       return bad(res, error.status || 400, error.message);
     }
@@ -490,6 +492,14 @@ export function registerSections(app, ctx) {
 
   async function resumeView(row) {
     const checks = (await findMany('hiring_checks', { resume_id: row.id })).sort((left, right) => left.label.localeCompare(right.label));
+    let fileAvailable = false;
+    if (row.file_stored) {
+      try {
+        fileAvailable = Boolean(await existsStored(row.file_stored));
+      } catch {
+        fileAvailable = true;
+      }
+    }
     return {
       id: row.id,
       positionId: row.position_id,
@@ -499,6 +509,7 @@ export function registerSections(app, ctx) {
       referralName: row.referral_name,
       fileName: row.file_name,
       fileStored: row.file_stored,
+      fileAvailable,
       uploadedBy: row.uploaded_by,
       uploaderName: row.uploader_name,
       status: row.status,
@@ -595,7 +606,7 @@ export function registerSections(app, ctx) {
     if (referralName.error) return bad(res, 400, referralName.error);
     let file;
     try {
-      file = saveFile(req.body.file);
+      file = await saveFile(req.body.file, 'resumes');
     } catch (error) {
       return bad(res, error.status || 400, error.message);
     }
@@ -620,6 +631,28 @@ export function registerSections(app, ctx) {
       created_at: now(),
     });
     res.status(201).json({ ok: true });
+  }));
+
+  app.post('/api/hiring/resumes/:id/file', requireAuth, wrap(async (req, res) => {
+    if (!hiringGate(req, res)) return undefined;
+    const row = await findOne('hiring_resumes', { _id: req.params.id });
+    if (!row) return bad(res, 404, 'Resume not found');
+    let file;
+    try {
+      file = await saveFile(req.body.file, 'resumes');
+    } catch (error) {
+      return bad(res, error.status || 400, error.message);
+    }
+    if (!file) return bad(res, 400, 'Attach the resume');
+    await updateOne('hiring_resumes', { _id: row.id }, { file_name: file.name, file_stored: file.stored });
+    if (row.file_stored && row.file_stored !== file.stored) {
+      try {
+        await deleteStored(row.file_stored);
+      } catch {
+        // The previous file is already gone.
+      }
+    }
+    res.json({ ok: true });
   }));
 
   app.post('/api/hiring/positions/:id/review', requireAuth, wrap(async (req, res) => {
@@ -820,7 +853,10 @@ export function registerSections(app, ctx) {
     if (incoming.length > 3) return bad(res, 400, 'Attach up to 3 screenshots');
     let saved = [];
     try {
-      saved = incoming.map((file) => saveImage(file)).filter(Boolean);
+      for (const file of incoming) {
+        const savedFile = await saveImage(file);
+        if (savedFile) saved.push(savedFile);
+      }
     } catch (error) {
       return bad(res, error.status || 400, error.message);
     }
@@ -961,7 +997,7 @@ export function registerSections(app, ctx) {
     const visible = rows.filter((row) => req.auth.isAdmin || row.organizer_id === req.auth.id || (row.attendee_ids || []).includes(req.auth.id));
     const users = await usersByIds(visible.flatMap((row) => [row.organizer_id, ...(row.attendee_ids || [])]));
     res.json({
-      googleConnected: googleConnected(),
+      googleConnected: await googleReady(),
       meetings: visible.map((row) => ({
         id: row.id,
         title: row.title,

@@ -13,6 +13,10 @@ export function readFile(file) {
   });
 }
 
+function filePath(stored) {
+  return String(stored || '').split('/').filter(Boolean).map((part) => encodeURIComponent(part)).join('/');
+}
+
 const PREVIEW_TYPES = {
   pdf: 'application/pdf',
   png: 'image/png',
@@ -29,15 +33,15 @@ export async function previewFileUrl(stored, name) {
   const type = PREVIEW_TYPES[ext];
   if (!type) return { url: '', kind: '' };
   if (ext === 'pdf') {
-    const ticketResponse = await fetch(`/api/files/${encodeURIComponent(stored)}/ticket`, { method: 'POST', headers });
-    if (ticketResponse.status === 404) throw new Error('That resume file is no longer on the server.');
+    const ticketResponse = await fetch(`/api/files/${filePath(stored)}/ticket`, { method: 'POST', headers });
+    if (ticketResponse.status === 404) throw new Error('That file is no longer available.');
     if (!ticketResponse.ok) throw new Error('Could not open that file');
     const data = await ticketResponse.json();
-    const url = `/api/files/${encodeURIComponent(stored)}?ticket=${encodeURIComponent(data.ticket)}&inline=1`;
+    const url = `/api/files/${filePath(stored)}?ticket=${encodeURIComponent(data.ticket)}&inline=1`;
     return { url, kind: 'pdf' };
   }
-  const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, { headers });
-  if (response.status === 404) throw new Error('That resume file is no longer on the server.');
+  const response = await fetch(`/api/files/${filePath(stored)}`, { headers });
+  if (response.status === 404) throw new Error('That file is no longer available.');
   if (!response.ok) throw new Error('Could not open that file');
   const blob = new Blob([await response.arrayBuffer()], { type });
   return { url: URL.createObjectURL(blob), kind: 'image' };
@@ -45,7 +49,7 @@ export async function previewFileUrl(stored, name) {
 
 export async function fileObjectUrl(stored) {
   const token = getToken();
-  const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, {
+  const response = await fetch(`/api/files/${filePath(stored)}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!response.ok) throw new Error('Could not open that file');
@@ -55,7 +59,7 @@ export async function fileObjectUrl(stored) {
 
 export async function downloadFile(stored, name) {
   const token = getToken();
-  const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, {
+  const response = await fetch(`/api/files/${filePath(stored)}`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!response.ok) throw new Error('Could not open that file');

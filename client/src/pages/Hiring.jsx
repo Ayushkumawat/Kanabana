@@ -267,6 +267,24 @@ function ResumeView({ url }) {
   );
 }
 
+function ReplaceResume({ busy, onFile }) {
+  return (
+    <label className="btn small replace-resume">
+      Re-upload resume
+      <input
+        type="file"
+        accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.png,.jpg,.jpeg,.txt,.md,.zip"
+        disabled={busy}
+        onChange={(event) => {
+          const file = event.target.files?.[0] || null;
+          event.target.value = '';
+          if (file) onFile(file);
+        }}
+      />
+    </label>
+  );
+}
+
 function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSchedule, account, onAccount, departments, run, toast }) {
   const canSchedule = ['shortlisted', 'next_round'].includes(row.status) && (row.uploadedBy === user.id || data.isAdmin || data.isHr);
   const canOutcome = row.status === 'scheduled' && (row.reviewerId === user.id || row.uploadedBy === user.id || data.isAdmin || data.isHr);
@@ -277,6 +295,12 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
     if (preview?.url?.startsWith('blob:')) URL.revokeObjectURL(preview.url);
     setPreview(null);
     setPreviewError('');
+  }
+
+  async function replaceResume(file) {
+    const body = await readFile(file);
+    closePreview();
+    await run(() => api(`/hiring/resumes/${row.id}/file`, { method: 'POST', body: { file: body } }), 'Resume uploaded');
   }
 
   async function openPreview() {
@@ -304,12 +328,18 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
         {row.referral ? ` · Referral ${row.referralName}` : ''}
         {row.reviewerName ? ` · Reviewer ${row.reviewerName}` : ''}
       </p>
-      <button type="button" className="btn small" onClick={openPreview}>View resume</button>
+      <div className="row-actions">
+        <button type="button" className="btn small" onClick={openPreview}>View resume</button>
+        {row.fileAvailable === false ? <ReplaceResume busy={busy} onFile={replaceResume} /> : null}
+      </div>
+      {row.fileAvailable === false ? <p className="error">The resume file is missing.</p> : null}
       {preview || previewError ? (
         <Modal title={row.candidateName} className="resume" onClose={closePreview}>
           <div className="resume-bar">
             <p className="muted">{row.fileName}</p>
-            <button type="button" className="btn small" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>Download</button>
+            {previewError ? <ReplaceResume busy={busy} onFile={replaceResume} /> : (
+              <button type="button" className="btn small" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>Download</button>
+            )}
           </div>
           {previewError ? <p className="error">{previewError}</p> : null}
           {preview?.loading ? <p className="muted">Opening the resume…</p> : null}
