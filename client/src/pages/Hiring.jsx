@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useAuth, useToast } from '../auth';
 import Field from '../components/Field';
 import FilePick from '../components/FilePick';
-import { downloadFile, readFile } from '../files';
+import Modal from '../components/Modal';
+import { downloadFile, previewFileUrl, readFile } from '../files';
 import { formatDay } from '../util';
 
 const STATUS_LABEL = {
@@ -150,7 +151,9 @@ export default function Hiring() {
                 <div className="form-actions"><button className="btn small" disabled={busy}>Send for review</button></div>
               </form>
             ) : null}
-            {resumes.length === 0 ? <p className="muted">No resumes yet.</p> : resumes.map((row) => (
+            {resumes.length === 0 ? <p className="muted">No resumes yet.</p> : (
+            <div className="hire-grid">
+            {resumes.map((row) => (
               <ResumeCard
                 key={row.id}
                 row={row}
@@ -171,6 +174,8 @@ export default function Hiring() {
                 toast={toast}
               />
             ))}
+            </div>
+            )}
             {mine.length ? (
               <button
                 type="button"
@@ -188,11 +193,107 @@ export default function Hiring() {
   );
 }
 
+function ResumeView({ url }) {
+  const hostRef = useRef(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return undefined;
+    let cancelled = false;
+    let task;
+    setError('');
+    (async () => {
+      const pdfjs = await import('pdfjs-dist');
+      const worker = await import('pdfjs-dist/build/pdf.worker.min.mjs?url');
+      pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
+      task = pdfjs.getDocument({ url });
+      const pdf = await task.promise;
+      if (cancelled) return;
+      host.replaceChildren();
+      const width = Math.max(host.clientWidth - 24, 280);
+      for (let number = 1; number <= pdf.numPages; number += 1) {
+        if (cancelled) return;
+        const page = await pdf.getPage(number);
+        const base = page.getViewport({ scale: 1 });
+        const viewport = page.getViewport({ scale: Math.min(1.5, width / base.width) });
+        const wrap = document.createElement('div');
+        wrap.className = 'resume-page';
+        wrap.style.width = `${viewport.width}px`;
+        wrap.style.height = `${viewport.height}px`;
+        const canvas = document.createElement('canvas');
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * ratio);
+        canvas.height = Math.floor(viewport.height * ratio);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+        const links = document.createElement('div');
+        links.className = 'resume-links';
+        wrap.append(canvas, links);
+        host.appendChild(wrap);
+        const transform = ratio === 1 ? null : [ratio, 0, 0, ratio, 0, 0];
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport, transform }).promise;
+        const notes = await page.getAnnotations();
+        for (const note of notes) {
+          const href = note.url || note.unsafeUrl || '';
+          if (note.subtype !== 'Link' || !href || !note.rect) continue;
+          const [x1, y1] = viewport.convertToViewportPoint(note.rect[0], note.rect[1]);
+          const [x2, y2] = viewport.convertToViewportPoint(note.rect[2], note.rect[3]);
+          const link = document.createElement('a');
+          link.href = href;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.style.left = `${Math.min(x1, x2)}px`;
+          link.style.top = `${Math.min(y1, y2)}px`;
+          link.style.width = `${Math.abs(x2 - x1)}px`;
+          link.style.height = `${Math.abs(y2 - y1)}px`;
+          links.appendChild(link);
+        }
+      }
+    })().catch((err) => {
+      if (!cancelled) setError(err.message || 'Could not open that file');
+    });
+    return () => {
+      cancelled = true;
+      task?.destroy();
+    };
+  }, [url]);
+
+  return (
+    <>
+      {error ? <p className="error">{error}</p> : null}
+      <div className="resume-pages" ref={hostRef} />
+    </>
+  );
+}
+
 function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSchedule, account, onAccount, departments, run, toast }) {
   const canSchedule = ['shortlisted', 'next_round'].includes(row.status) && (row.uploadedBy === user.id || data.isAdmin || data.isHr);
   const canOutcome = row.status === 'scheduled' && (row.reviewerId === user.id || row.uploadedBy === user.id || data.isAdmin || data.isHr);
+  const [preview, setPreview] = useState(null);
+  const [previewError, setPreviewError] = useState('');
+
+  function closePreview() {
+    if (preview?.url?.startsWith('blob:')) URL.revokeObjectURL(preview.url);
+    setPreview(null);
+    setPreviewError('');
+  }
+
+  async function openPreview() {
+    setPreview({ url: '', kind: '', loading: true });
+    setPreviewError('');
+    try {
+      const next = await previewFileUrl(row.fileStored, row.fileName);
+      setPreview({ ...next, loading: false });
+    } catch (err) {
+      setPreview(null);
+      setPreviewError(err.message);
+      toast(err.message, 'bad');
+    }
+  }
+
   return (
-    <article className="stack">
+    <article className="hire-card">
       <div className="row-between">
         <strong>{row.candidateName}</strong>
         <span className="pill">{STATUS_LABEL[row.status] || row.status}{row.round > 1 ? ` · round ${row.round}` : ''}</span>
@@ -203,7 +304,24 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
         {row.referral ? ` · Referral ${row.referralName}` : ''}
         {row.reviewerName ? ` · Reviewer ${row.reviewerName}` : ''}
       </p>
-      <button type="button" className="btn small ghost" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>{row.fileName}</button>
+      <button type="button" className="btn small" onClick={openPreview}>View resume</button>
+      {preview || previewError ? (
+        <Modal title={row.candidateName} className="resume" onClose={closePreview}>
+          <div className="resume-bar">
+            <p className="muted">{row.fileName}</p>
+            <button type="button" className="btn small" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>Download</button>
+          </div>
+          {previewError ? <p className="error">{previewError}</p> : null}
+          {preview?.loading ? <p className="muted">Opening the resume…</p> : null}
+          {preview?.kind === 'pdf' && preview.url ? <ResumeView url={preview.url} /> : null}
+          {preview?.kind === 'image' && preview.url ? (
+            <img className="resume-frame" alt={row.fileName} src={preview.url} />
+          ) : null}
+          {preview && !preview.loading && !preview.kind ? (
+            <p className="muted">This file can’t be shown on the page. Download it to open it.</p>
+          ) : null}
+        </Modal>
+      ) : null}
       {row.status === 'in_review' && (row.reviewerId === user.id || data.isAdmin) ? (
         <label className="check">
           <input type="checkbox" checked={selected} onChange={onToggle} />

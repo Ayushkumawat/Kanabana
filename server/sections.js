@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -25,6 +26,7 @@ import { createGoogleMeet, deleteGoogleEvent, googleConnected } from './google.j
 import { isTime, sendInvites } from './meetings.js';
 
 const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'uploads');
+const fileTickets = new Map();
 const ALLOWED = new Set(['pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'png', 'jpg', 'jpeg', 'txt', 'md', 'zip']);
 const ONBOARDING = ['Adding to Razorpay', 'Gate access', 'Document verification', 'System access'];
 const IMAGES = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
@@ -171,11 +173,43 @@ export function registerSections(app, ctx) {
     res.json({ notes: await notepadList(req.auth.id) });
   }));
 
-  app.get('/api/files/:stored', requireAuth, (req, res) => {
+  function storedFile(req) {
     const stored = path.basename(String(req.params.stored || ''));
     const full = path.join(uploadDir, stored);
-    if (!stored || !fs.existsSync(full)) return bad(res, 404, 'File not found');
-    res.download(full);
+    if (!stored || stored === '.' || stored === '..' || !fs.existsSync(full)) return null;
+    return { stored, full };
+  }
+
+  function ticketMatches(req, stored) {
+    const ticket = String(req.query.ticket || '');
+    const row = ticket ? fileTickets.get(ticket) : null;
+    if (!row || row.stored !== stored || row.exp < Date.now()) return false;
+    return true;
+  }
+
+  app.post('/api/files/:stored/ticket', requireAuth, (req, res) => {
+    const file = storedFile(req);
+    if (!file) return bad(res, 404, 'File not found');
+    const nowMs = Date.now();
+    for (const [key, row] of fileTickets) if (row.exp < nowMs) fileTickets.delete(key);
+    const ticket = crypto.randomBytes(24).toString('hex');
+    fileTickets.set(ticket, { stored: file.stored, exp: nowMs + 10 * 60 * 1000 });
+    res.json({ ticket });
+  });
+
+  app.get('/api/files/:stored', (req, res, next) => {
+    const file = storedFile(req);
+    if (ticketMatches(req, file?.stored)) return next();
+    return requireAuth(req, res, next);
+  }, (req, res) => {
+    const file = storedFile(req);
+    if (!file) return bad(res, 404, 'File not found');
+    if (String(req.query.inline || '') === '1') {
+      res.setHeader('Content-Disposition', 'inline');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.sendFile(file.full);
+    }
+    res.download(file.full);
   });
 
   app.get('/api/knowledge', requireAuth, wrap(async (req, res) => {

@@ -452,6 +452,22 @@ textarea { min-height: 88px; resize: vertical; }
 }
 .feed-item { display: grid; gap: 2px; }
 .feed-item small { color: var(--muted); }
+.hire-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.hire-card { display: grid; gap: 8px; align-content: start; min-width: 0; padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: 14px; }
+.hire-card .btn { width: fit-content; }
+.hire-card .row-between { align-items: flex-start; }
+.hire-card .fields.two { grid-template-columns: 1fr; }
+.hire-card p { margin: 0; overflow-wrap: anywhere; }
+.resume-bar { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.resume-bar p { margin: 0; overflow-wrap: anywhere; }
+.modal.resume { width: min(1040px, 96vw); height: auto; max-height: 92vh; display: flex; flex-direction: column; }
+.modal.resume .resume-frame { width: 100%; height: min(72vh, 760px); border: 1px solid var(--line); border-radius: 12px; background: #fff; object-fit: contain; }
+.resume-pages { overflow: auto; max-height: min(72vh, 760px); padding: 12px; background: #525659; border-radius: 12px; display: grid; justify-items: center; gap: 12px; }
+.resume-page { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); }
+.resume-page canvas { display: block; }
+.resume-links { position: absolute; inset: 0; }
+.resume-links a { position: absolute; }
+.modal.resume img.resume-frame { object-fit: contain; }
 .pick-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px 16px; max-height: 240px; overflow: auto; padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: 12px; }
 .pick-list label { display: flex; gap: 8px; align-items: center; min-width: 0; }
 .pick-list input { width: auto; flex: none; padding: 0; }
@@ -513,6 +529,9 @@ textarea { min-height: 88px; resize: vertical; }
   .board-body, .people-layout, .insights { grid-template-columns: 1fr; }
   .week-list { position: static; }
 }
+@media (max-width: 1200px) {
+  .hire-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 1100px) {
   .split, .login { grid-template-columns: 1fr; }
   .people-list { position: static; grid-auto-flow: column; grid-auto-columns: 200px; overflow-x: auto; }
@@ -525,4 +544,5 @@ textarea { min-height: 88px; resize: vertical; }
   .sidebar-foot { display: none; }
   .content { overflow: visible; }
   .fields.two, .fields.three { grid-template-columns: 1fr; }
+  .hire-grid { grid-template-columns: 1fr; }
 }

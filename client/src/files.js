@@ -13,6 +13,36 @@ export function readFile(file) {
   });
 }
 
+const PREVIEW_TYPES = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+};
+
+export async function previewFileUrl(stored, name) {
+  const token = getToken();
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const ext = String(name || stored).split('.').pop().toLowerCase();
+  const type = PREVIEW_TYPES[ext];
+  if (!type) return { url: '', kind: '' };
+  if (ext === 'pdf') {
+    const ticketResponse = await fetch(`/api/files/${encodeURIComponent(stored)}/ticket`, { method: 'POST', headers });
+    if (ticketResponse.status === 404) throw new Error('That resume file is no longer on the server.');
+    if (!ticketResponse.ok) throw new Error('Could not open that file');
+    const data = await ticketResponse.json();
+    const url = `/api/files/${encodeURIComponent(stored)}?ticket=${encodeURIComponent(data.ticket)}&inline=1`;
+    return { url, kind: 'pdf' };
+  }
+  const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, { headers });
+  if (response.status === 404) throw new Error('That resume file is no longer on the server.');
+  if (!response.ok) throw new Error('Could not open that file');
+  const blob = new Blob([await response.arrayBuffer()], { type });
+  return { url: URL.createObjectURL(blob), kind: 'image' };
+}
+
 export async function fileObjectUrl(stored) {
   const token = getToken();
   const response = await fetch(`/api/files/${encodeURIComponent(stored)}`, {
