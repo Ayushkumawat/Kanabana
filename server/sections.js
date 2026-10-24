@@ -21,7 +21,7 @@ import {
 } from './db.js';
 import { audienceUsers, mustAck } from './announcements.js';
 import { sendDependencyEmail } from './mail.js';
-import { createGoogleMeet, deleteGoogleEvent } from './google.js';
+import { createGoogleMeet, deleteGoogleEvent, googleConnected } from './google.js';
 import { isTime, sendInvites } from './meetings.js';
 
 const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'uploads');
@@ -927,6 +927,7 @@ export function registerSections(app, ctx) {
     const visible = rows.filter((row) => req.auth.isAdmin || row.organizer_id === req.auth.id || (row.attendee_ids || []).includes(req.auth.id));
     const users = await usersByIds(visible.flatMap((row) => [row.organizer_id, ...(row.attendee_ids || [])]));
     res.json({
+      googleConnected: googleConnected(),
       meetings: visible.map((row) => ({
         id: row.id,
         title: row.title,

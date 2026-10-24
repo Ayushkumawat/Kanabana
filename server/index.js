@@ -733,6 +733,26 @@ app.patch('/api/me', requireAuth, wrap(async (req, res) => {
   res.json({ user: await userContext(req.auth.id) });
 }));
 
+app.post('/api/google/connect', requireAuth, requireAdmin, wrap(async (_req, res) => {
+  try {
+    res.json({ url: googleAuthUrl() });
+  } catch (error) {
+    bad(res, error.status || 500, error.message);
+  }
+}));
+
+app.get('/api/google/callback', wrap(async (req, res) => {
+  try {
+    await finishGoogleAuth(String(req.query.code || ''), String(req.query.state || ''));
+  } catch (error) {
+    const message = String(error.message || 'Google Calendar could not be connected.')
+      .replace(/[&<>]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[char]));
+    res.status(400).type('html').send(`<!doctype html><p>${message}</p><p><a href="/meetings">Back to meetings</a></p>`);
+    return;
+  }
+  res.redirect('/meetings');
+}));
+
 app.post('/api/me/password', requireAuth, wrap(async (req, res) => {
   const next = readPassword(req.body.nextPassword);
   if (next.error) return bad(res, 400, next.error);

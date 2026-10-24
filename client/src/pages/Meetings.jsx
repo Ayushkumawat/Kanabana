@@ -17,9 +17,13 @@ export default function Meetings() {
   const [userIds, setUserIds] = useState([]);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [googleReady, setGoogleReady] = useState(true);
 
   function load() {
-    return api('/meetings').then((data) => setMeetings(data.meetings));
+    return api('/meetings').then((data) => {
+      setMeetings(data.meetings);
+      setGoogleReady(Boolean(data.googleConnected));
+    });
   }
 
   useEffect(() => {
@@ -29,6 +33,16 @@ export default function Meetings() {
 
   function toggle(id) {
     setUserIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }
+
+  async function connectGoogle() {
+    setError('');
+    try {
+      const data = await api('/google/connect', { method: 'POST' });
+      window.location.assign(data.url);
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
   async function submit(event) {
@@ -66,6 +80,12 @@ export default function Meetings() {
         </div>
       </div>
       {error ? <p className="banner">{error}</p> : null}
+      {!googleReady ? (
+        <p className="banner">
+          Google Calendar isn’t connected, so a meeting email can’t include a Meet link yet.
+          {user.isAdmin ? <> <button type="button" className="btn small" onClick={connectGoogle}>Connect Google Calendar</button></> : ' Ask an admin to connect it.'}
+        </p>
+      ) : null}
       <form className="panel stack" onSubmit={submit}>
         <Field label="Title">
           <input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={140} required />

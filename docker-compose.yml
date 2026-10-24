@@ -13,7 +13,7 @@ services:
       NODE_ENV: production
       PORT: "4050"
     volumes:
-      - ./server/data/uploads:/app/server/data/uploads
+      - ./server/data:/app/server/data
     restart: unless-stopped
 
   mongo:
