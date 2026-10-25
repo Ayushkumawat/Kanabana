@@ -186,6 +186,7 @@ export function clashInfo(tasks) {
 
 export function roleLabel(user) {
   if (user.isAdmin) return 'Admin';
+  if (user.isManager) return 'Manager';
   if (user.isLead) return 'Team lead';
   return 'Member';
 }

@@ -199,7 +199,7 @@ export default function Reports() {
       </div>
       <div className="panel report-list">
         {visible.length === 0 ? <p className="muted">Nothing in this list yet.</p> : visible.map((report) => {
-          const canUpdate = user.id === report.authorId || user.isAdmin || user.isLead;
+          const canUpdate = user.id === report.authorId || user.isAdmin || user.isManager || user.isLead;
           return (
             <article key={report.id} className={`report-card${report.status === 'fixed' ? ' fixed' : ''}`}>
               <header>

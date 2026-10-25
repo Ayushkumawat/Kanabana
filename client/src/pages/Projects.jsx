@@ -32,16 +32,16 @@ export default function Projects() {
     return api('/projects').then((data) => setProjects(data.projects)).catch((err) => setError(err.message));
   }
 
-  const canCreate = user.isAdmin || user.isLead;
+  const canCreate = user.isAdmin || user.isLead || user.isManager;
   const departmentChoices = departments;
 
   useEffect(() => {
     load();
-    if (user.isAdmin || user.isLead) {
+    if (user.isAdmin || user.isLead || user.isManager) {
       api('/departments').then((data) => setDepartments(data.departments)).catch(() => {});
       api('/users').then((data) => setPeople(data.users.filter((person) => person.active))).catch(() => {});
     }
-  }, [user.isAdmin, user.isLead]);
+  }, [user.isAdmin, user.isLead, user.isManager]);
 
   const memberChoices = useMemo(
     () => people.filter((person) => person.departments.some((item) => form.departmentIds.includes(item.id))),
@@ -76,13 +76,13 @@ export default function Projects() {
       <div className="page-head">
         <div>
           <h1>Projects</h1>
-          <p className="lede">Every project is listed. You can open the ones you’re on. Each team on a project sets its own timeline.</p>
+          <p className="lede">{user.isAdmin || user.isManager ? 'Every project is open to you, including the work inside it.' : 'Every project is listed. You can open the ones you’re on. Each team on a project sets its own timeline.'}</p>
         </div>
         {canCreate ? <button type="button" className="btn primary" onClick={() => setCreating(true)}>New project</button> : null}
       </div>
       {error ? <p className="banner">{error}</p> : null}
       {blocked ? <p className="banner">{LOCKED}</p> : null}
-      {projects.length === 0 ? <p className="muted">No projects yet. An admin or a team lead can add one.</p> : null}
+      {projects.length === 0 ? <p className="muted">No projects yet. An admin, a manager, or a team lead can add one.</p> : null}
       <div className="project-grid">
         {projects.map((project) => {
           const pct = project.taskCount ? Math.round((project.doneCount / project.taskCount) * 100) : 0;

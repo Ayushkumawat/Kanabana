@@ -46,8 +46,8 @@ const LINKS = GROUPS.flatMap((group) => group.links);
 
 function showLink(item, user) {
   if (!item.gate || user.isAdmin) return true;
-  if (item.gate === 'lead') return user.isLead;
-  if (item.gate === 'office') return user.isLead || user.isHr;
+  if (item.gate === 'lead') return user.isLead || user.isManager;
+  if (item.gate === 'office') return user.isLead || user.isHr || user.isManager;
   return false;
 }
 

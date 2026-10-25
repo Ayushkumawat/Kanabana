@@ -17,12 +17,13 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
   const [busy, setBusy] = useState(false);
 
   const project = choices.find((item) => item.id === projectId) || projects.find((item) => item.id === projectId);
-  const canAssign = user.isAdmin || (user.isLead && (!projectId || project?.canAssign));
+  const wide = user.isAdmin || user.isManager;
+  const canAssign = wide || (user.isLead && (!projectId || project?.canAssign));
   const onProject = project ? project.members.filter((member) => member.active !== false) : people;
   const fromTeams = project && canAssign
     ? people.filter((person) => person.active !== false
       && !project.members.some((member) => member.id === person.id)
-      && person.departments?.some((item) => project.departments.some((team) => team.id === item.id)))
+      && (wide || person.departments?.some((item) => project.departments.some((team) => team.id === item.id))))
     : [];
   const adding = fromTeams.some((person) => person.id === assigneeId);
 
@@ -30,7 +31,7 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
     setProjectId(value);
     const nextProject = choices.find((item) => item.id === value) || projects.find((item) => item.id === value);
     const pool = nextProject ? nextProject.members.filter((member) => member.active !== false) : people;
-    const mayAssign = user.isAdmin || (user.isLead && (!value || nextProject?.canAssign));
+    const mayAssign = user.isAdmin || user.isManager || (user.isLead && (!value || nextProject?.canAssign));
     if (mayAssign && pool[0] && !pool.some((person) => person.id === assigneeId)) setAssigneeId(pool[0].id);
     if (!mayAssign) setAssigneeId(user.id);
   }
@@ -92,7 +93,7 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
           <select value={assigneeId} onChange={(event) => setAssigneeId(event.target.value)}>
             {project ? <optgroup label="On this project">{onProject.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</optgroup> : onProject.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}
             {fromTeams.length ? (
-              <optgroup label="Add from these teams">
+              <optgroup label={user.isAdmin || user.isManager ? 'Anyone else' : 'Add from these teams'}>
                 {fromTeams.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}
               </optgroup>
             ) : null}

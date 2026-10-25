@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { canMoveTask, COLUMNS, formatDay, isOverdue } from '../util';
 
-export default function Kanban({ tasks, user, onOpen, onMove, clashIds }) {
+export default function Kanban({ tasks, user, onOpen, onMove, onAdd, clashIds }) {
   const [dragId, setDragId] = useState(null);
   const [over, setOver] = useState(null);
   const dragged = useRef(false);
@@ -38,7 +38,12 @@ export default function Kanban({ tasks, user, onOpen, onMove, clashIds }) {
           >
             <header className="lane-head">
               {column.label}
-              <span>{cards.length}</span>
+              <span className="lane-tools">
+                {column.id === 'upcoming' && onAdd ? (
+                  <button type="button" className="lane-add" aria-label="Add task" onClick={onAdd}>+</button>
+                ) : null}
+                <span>{cards.length}</span>
+              </span>
             </header>
             <div className="lane-body">
               {cards.length === 0 ? <p className="empty">Nothing here</p> : null}

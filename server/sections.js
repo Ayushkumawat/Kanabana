@@ -77,7 +77,16 @@ function saveFile(file, folder) {
 }
 
 function canOffice(auth) {
-  return auth.isAdmin || auth.isLead || auth.isHr;
+  return auth.isAdmin || auth.isManager || auth.isLead || auth.isHr;
+}
+
+function seesConfidential(auth) {
+  return Boolean(auth.isAdmin || auth.isManager);
+}
+
+async function privateAssigneeIds() {
+  const rows = await findMany('users', { manager: 1 });
+  return new Set(rows.map((row) => row.id));
 }
 
 export function registerSections(app, ctx) {
@@ -414,6 +423,7 @@ export function registerSections(app, ctx) {
       }];
     });
     const openTasks = (await findMany('tasks', { status: { $ne: 'done' } })).sort((left, right) => left.due_date.localeCompare(right.due_date) || left.title.localeCompare(right.title));
+    const hiddenAssignees = seesConfidential(req.auth) ? new Set() : await privateAssigneeIds();
     const assignees = await usersByIds(openTasks.map((task) => task.assignee_id));
     const people = (await findMany('users', { active: 1 })).sort((left, right) => left.name.localeCompare(right.name))
       .map((person) => ({ id: person.id, name: person.name }));
@@ -423,6 +433,7 @@ export function registerSections(app, ctx) {
       tasks: openTasks.flatMap((task) => {
         const assignee = assignees.get(task.assignee_id);
         if (!assignee) return [];
+        if (task.assignee_id !== req.auth.id && hiddenAssignees.has(task.assignee_id)) return [];
         return [{ id: task.id, title: task.title, assigneeName: assignee.name }];
       }),
       people,
@@ -435,6 +446,10 @@ export function registerSections(app, ctx) {
     if (task.status === 'done') return bad(res, 400, 'That task is already done');
     const person = await activeUser(req.body.dependsOnId);
     if (!person) return bad(res, 400, 'Choose the person this depends on');
+    const taskOwner = await findOne('users', { _id: task.assignee_id });
+    if (task.assignee_id !== req.auth.id && !seesConfidential(req.auth) && taskOwner?.manager) {
+      return bad(res, 403, 'You can’t attach help to that task');
+    }
     if (person.id === req.auth.id) return bad(res, 400, 'Choose someone else');
     const note = readText(req.body.note, 500, 'what you need', true);
     if (note.error) return bad(res, 400, note.error);
@@ -452,20 +467,37 @@ export function registerSections(app, ctx) {
     });
     await notify(person.id, `${req.auth.name} needs you on “${task.title}”. ${note.value}`, task.id, task.project_id, 'dependencies');
     await sendDependencyEmail(person, req.auth, task, note.value);
-    const leads = await findMany('user_departments', { user_id: person.id });
-    if (leads.length) {
-      const departments = await findMany('departments', { _id: { $in: leads.map((link) => link.department_id) } });
-      const told = new Set([person.id, req.auth.id]);
-      for (const department of departments) {
-        if (!department.lead_id || told.has(department.lead_id)) continue;
-        told.add(department.lead_id);
+    const told = new Set([person.id, req.auth.id]);
+    const watchers = person.manager
+      ? (await findMany('users', { active: 1 })).filter((user) => user.manager || user.role === 'admin')
+      : [];
+    if (person.manager) {
+      for (const watcher of watchers) {
+        if (told.has(watcher.id)) continue;
+        told.add(watcher.id);
         await notify(
-          department.lead_id,
+          watcher.id,
           `${req.auth.name} is waiting on ${person.name} for “${task.title}”. ${note.value}`,
           task.id,
           task.project_id,
           'dependencies',
         );
+      }
+    } else {
+      const leads = await findMany('user_departments', { user_id: person.id });
+      if (leads.length) {
+        const departments = await findMany('departments', { _id: { $in: leads.map((link) => link.department_id) } });
+        for (const department of departments) {
+          if (!department.lead_id || told.has(department.lead_id)) continue;
+          told.add(department.lead_id);
+          await notify(
+            department.lead_id,
+            `${req.auth.name} is waiting on ${person.name} for “${task.title}”. ${note.value}`,
+            task.id,
+            task.project_id,
+            'dependencies',
+          );
+        }
       }
     }
     await logActivity(req.auth.id, `${req.auth.name} asked ${person.name} for help on “${task.title}”.`, task.id, task.project_id);
@@ -885,7 +917,7 @@ export function registerSections(app, ctx) {
     if (!row) return bad(res, 404, 'Report not found');
     const status = req.body.status === 'fixed' ? 'fixed' : req.body.status === 'open' ? 'open' : '';
     if (!status) return bad(res, 400, 'Choose open or fixed');
-    if (row.author_id !== req.auth.id && !req.auth.isAdmin && !req.auth.isLead) {
+    if (row.author_id !== req.auth.id && !req.auth.isAdmin && !req.auth.isManager && !req.auth.isLead) {
       return bad(res, 403, 'Only the author or a lead can update this');
     }
     await updateOne('reports', { _id: row.id }, { status });

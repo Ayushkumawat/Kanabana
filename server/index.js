@@ -145,6 +145,7 @@ async function shapeUsers(rows) {
       role: row.role,
       active: Boolean(row.active),
       isAdmin: row.role === 'admin',
+      isManager: Boolean(row.manager),
       isLead: leadOf.length > 0,
       isHr: row.role === 'admin' || personDepartments.some((item) => item.name.toLowerCase() === 'hr'),
       birthday: row.birthday || null,
@@ -205,8 +206,30 @@ function isProjectMember(projectId, userId) {
 
 const NOT_ON_PROJECT = 'You’re not part of this project. Ask the team lead to add you.';
 
+function seesConfidential(auth) {
+  return Boolean(auth.isAdmin || auth.isManager);
+}
+
+async function managerIdSet() {
+  const rows = await findMany('users', { manager: 1 });
+  return new Set(rows.map((row) => row.id));
+}
+
+async function isPrivateAssignee(userId) {
+  if (!userId) return false;
+  const row = await findOne('users', { _id: userId });
+  return Boolean(row?.manager);
+}
+
+async function omitPrivateTasks(auth, tasks) {
+  if (seesConfidential(auth) || !tasks.length) return tasks;
+  const hidden = await managerIdSet();
+  if (!hidden.size) return tasks;
+  return tasks.filter((task) => !hidden.has(task.assignee_id));
+}
+
 async function canViewProject(auth, projectId) {
-  if (auth.isAdmin || await isProjectMember(projectId, auth.id)) return true;
+  if (auth.isAdmin || auth.isManager || await isProjectMember(projectId, auth.id)) return true;
   const project = await findOne('projects', { _id: projectId });
   if (project?.created_by === auth.id) return true;
   const projectDepartments = await findMany('project_departments', { project_id: projectId });
@@ -241,13 +264,14 @@ async function canDeleteProject(auth, row) {
 
 async function canAssignOnProject(auth, project) {
   if (!project) return false;
-  if (auth.isAdmin || project.created_by === auth.id) return true;
+  if (auth.isAdmin || auth.isManager || project.created_by === auth.id) return true;
   const ids = await projectDepartmentIds(project.id);
   return ids.some((departmentId) => auth.leadDepartmentIds.includes(departmentId));
 }
 
 async function canGovernTask(auth, task) {
   if (!task) return false;
+  if (!seesConfidential(auth) && task.assignee_id !== auth.id && await isPrivateAssignee(task.assignee_id)) return false;
   if (auth.isAdmin) return true;
   if (auth.isLead && task.creator_id === auth.id) return true;
   return assigneeInLeadDepts(auth, task.assignee_id);
@@ -264,6 +288,13 @@ async function leadIdsFor(userId) {
 }
 
 async function requestRecipients(task) {
+  if (await isPrivateAssignee(task.assignee_id)) {
+    const managers = await findMany('users', { manager: 1, active: 1 });
+    const admins = await findMany('users', { role: 'admin', active: 1 });
+    const ids = new Set([...managers, ...admins].map((user) => user.id));
+    ids.delete(task.assignee_id);
+    return [...ids];
+  }
   const ids = new Set(await leadIdsFor(task.assignee_id));
   if (await exists('departments', { lead_id: task.creator_id })) ids.add(task.creator_id);
   ids.delete(task.assignee_id);
@@ -296,8 +327,9 @@ async function openRequest(task, kind, auth, note) {
 }
 
 async function canHandleRequest(auth, row) {
-  if (auth.isAdmin) return true;
   const assigneeId = row.assignee_id || row.assigneeId;
+  if (await isPrivateAssignee(assigneeId)) return seesConfidential(auth);
+  if (auth.isAdmin || auth.isManager) return true;
   const creatorId = row.creator_id || row.creatorId;
   if (await assigneeInLeadDepts(auth, assigneeId)) return true;
   return Boolean(auth.isLead && creatorId === auth.id);
@@ -334,6 +366,7 @@ async function presentProjects(rows, auth, withHistory = false) {
   for (const link of memberLinks) userIds.add(link.user_id);
   for (const item of history) userIds.add(item.actor_id);
   const users = await usersByIds([...userIds]);
+  const privateAssignees = seesConfidential(auth) ? new Set() : await managerIdSet();
   const linksByProject = groupBy(deptLinks, 'project_id');
   const membersByProject = groupBy(memberLinks, 'project_id');
   const tasksByProject = groupBy(tasks, 'project_id');
@@ -350,8 +383,9 @@ async function presentProjects(rows, auth, withHistory = false) {
       .filter(Boolean)
       .sort(byName)
       .map((member) => ({ id: member.id, name: member.name, active: Boolean(member.active) }));
-    const projectTasks = tasksByProject.get(row.id) || [];
+    const projectTasks = (tasksByProject.get(row.id) || []).filter((task) => !privateAssignees.has(task.assignee_id));
     const onTeam = projectDepartments.some((item) => auth.leadDepartmentIds.includes(item.id));
+    const wide = auth.isAdmin || auth.isManager;
     const savedTimelines = timelinesByProject.get(row.id) || [];
     const teamTimelines = projectDepartments.map((department) => {
       const saved = savedTimelines.find((item) => item.department_id === department.id);
@@ -396,10 +430,10 @@ async function presentProjects(rows, auth, withHistory = false) {
       createdByName: users.get(row.created_by)?.name || '',
       canManage: auth.isAdmin || row.created_by === auth.id,
       canDelete: auth.isAdmin || row.created_by === auth.id || onTeam,
-      canAssign: auth.isAdmin || row.created_by === auth.id || onTeam,
+      canAssign: wide || row.created_by === auth.id || onTeam,
       canEditTimeline: auth.isAdmin || onTeam,
-      canOpen: auth.isAdmin || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
-      canAddTask: auth.isAdmin || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
+      canOpen: wide || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
+      canAddTask: wide || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
     };
     if (!withHistory) return project;
     const items = (historyByProject.get(row.id) || []).map((item) => ({
@@ -461,7 +495,8 @@ function mapTask(row, weekEnd, weekStart = null) {
 
 async function canSeeTask(auth, task) {
   if (!task) return false;
-  if (auth.isAdmin || task.assignee_id === auth.id || task.creator_id === auth.id) return true;
+  if (task.assignee_id !== auth.id && !seesConfidential(auth) && await isPrivateAssignee(task.assignee_id)) return false;
+  if (auth.isAdmin || auth.isManager || task.assignee_id === auth.id || task.creator_id === auth.id) return true;
   if (await assigneeInLeadDepts(auth, task.assignee_id)) return true;
   if (task.project_id) {
     const project = await findOne('projects', { _id: task.project_id });
@@ -606,7 +641,8 @@ async function rawTask(taskId) {
 }
 
 async function canTouchRule(auth, rule) {
-  if (auth.isAdmin || rule.created_by === auth.id || rule.assignee_id === auth.id) return true;
+  if (rule.assignee_id !== auth.id && !seesConfidential(auth) && await isPrivateAssignee(rule.assignee_id)) return false;
+  if (auth.isAdmin || auth.isManager || rule.created_by === auth.id || rule.assignee_id === auth.id) return true;
   return assigneeInLeadDepts(auth, rule.assignee_id);
 }
 
@@ -778,7 +814,9 @@ app.post('/api/users', requireAuth, requireAdmin, wrap(async (req, res) => {
   if (email.error) return bad(res, 400, email.error);
   const password = readPassword(req.body.password);
   if (password.error) return bad(res, 400, password.error);
-  const departmentIds = uniqueList(req.body.departmentIds);
+  const manager = req.body.manager === true;
+  let departmentIds = uniqueList(req.body.departmentIds);
+  if (manager) departmentIds = (await findMany('departments', {})).map((department) => department.id);
   const leadDepartmentId = req.body.leadDepartmentId || null;
   if (!departmentIds.length) return bad(res, 400, 'Choose at least one department');
   const found = await findMany('departments', { _id: { $in: departmentIds } });
@@ -799,6 +837,7 @@ app.post('/api/users', requireAuth, requireAdmin, wrap(async (req, res) => {
         password_hash: bcrypt.hashSync(password.value, 10),
         role: 'member',
         active: 1,
+        manager: manager ? 1 : 0,
         birthday: req.body.birthday,
         work_anniversary: req.body.workAnniversary,
         created_at: now(),
@@ -823,7 +862,9 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) => 
   if (name.error) return bad(res, 400, name.error);
   const email = readEmail(req.body.email);
   if (email.error) return bad(res, 400, email.error);
-  const departmentIds = uniqueList(req.body.departmentIds);
+  const manager = req.body.manager === undefined ? Boolean(current.manager) : req.body.manager === true;
+  let departmentIds = uniqueList(req.body.departmentIds);
+  if (manager) departmentIds = (await findMany('departments', {})).map((department) => department.id);
   const active = req.body.active !== false;
   if (!departmentIds.length) return bad(res, 400, 'Each person needs at least one department');
   const found = await findMany('departments', { _id: { $in: departmentIds } });
@@ -852,6 +893,7 @@ app.patch('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) => 
       name: name.value,
       email: email.value,
       active: active ? 1 : 0,
+      manager: manager ? 1 : 0,
       birthday,
       work_anniversary: workAnniversary,
     });
@@ -1187,11 +1229,12 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, wrap(async (req, res) =>
   }
 }));
 
-app.get('/api/departments', requireAuth, wrap(async (_req, res) => {
+app.get('/api/departments', requireAuth, wrap(async (req, res) => {
   const departments = (await findMany('departments', {})).sort(byName);
   const leads = await usersByIds(departments.map((department) => department.lead_id));
   const links = await findMany('user_departments', {});
   const members = await usersByIds(links.map((link) => link.user_id));
+  const showPrivate = seesConfidential(req.auth);
   res.json({
     departments: departments.map((department) => ({
       id: department.id,
@@ -1202,7 +1245,7 @@ app.get('/api/departments', requireAuth, wrap(async (_req, res) => {
       members: links
         .filter((link) => link.department_id === department.id)
         .map((link) => members.get(link.user_id))
-        .filter(Boolean)
+        .filter((member) => member && (showPrivate || !member.manager))
         .sort(byName)
         .map((member) => ({ id: member.id, name: member.name, active: Boolean(member.active) })),
     })),
@@ -1219,6 +1262,9 @@ app.post('/api/departments', requireAuth, requireAdmin, wrap(async (req, res) =>
     await withTx(async () => {
       await insertOne('departments', { id: departmentId, name: name.value, lead_id: lead.id, created_at: now() });
       await insertIgnore('user_departments', { _id: `${lead.id}:${departmentId}`, user_id: lead.id, department_id: departmentId });
+      for (const manager of await findMany('users', { manager: 1 })) {
+        await insertIgnore('user_departments', { _id: `${manager.id}:${departmentId}`, user_id: manager.id, department_id: departmentId });
+      }
       await logActivity(req.auth.id, `${req.auth.name} added the ${name.value} department with ${lead.name} as lead.`);
     });
   } catch (error) {
@@ -1290,7 +1336,7 @@ app.get('/api/projects', requireAuth, wrap(async (req, res) => {
 }));
 
 app.post('/api/projects', requireAuth, wrap(async (req, res) => {
-  if (!req.auth.isAdmin && !req.auth.isLead) return bad(res, 403, 'Only an admin or a team lead can create a project');
+  if (!req.auth.isAdmin && !req.auth.isLead && !req.auth.isManager) return bad(res, 403, 'Only an admin, a manager, or a team lead can create a project');
   const name = readText(req.body.name, 120, 'a project name', true);
   if (name.error) return bad(res, 400, name.error);
   const description = readText(req.body.description, 4000, 'the description');
@@ -1472,7 +1518,7 @@ app.post('/api/projects/:id/members', requireAuth, wrap(async (req, res) => {
   if (!member) return bad(res, 400, 'Choose an active person');
   if (await isProjectMember(row.id, member.id)) return bad(res, 400, 'They are already on this project');
   const departmentIds = await projectDepartmentIds(row.id);
-  if (!await userInDepartments(member.id, departmentIds)) {
+  if (!req.auth.isAdmin && !req.auth.isManager && !await userInDepartments(member.id, departmentIds)) {
     return bad(res, 400, `${member.name} is not in this project’s departments`);
   }
   await insertOne('project_members', { _id: `${row.id}:${member.id}`, project_id: row.id, user_id: member.id });
@@ -1547,7 +1593,10 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
       const assigneeId = scope === 'person' ? req.query.userId : req.auth.id;
       if (scope === 'person') {
         if (!await exists('users', { _id: assigneeId })) return bad(res, 404, 'Person not found');
-        if (!req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, assigneeId)) {
+        if (assigneeId !== req.auth.id && !seesConfidential(req.auth) && await isPrivateAssignee(assigneeId)) {
+          return bad(res, 403, 'That board is private');
+        }
+        if (assigneeId !== req.auth.id && !req.auth.isAdmin && !req.auth.isManager && !await assigneeInLeadDepts(req.auth, assigneeId)) {
           return bad(res, 403, 'You can open boards for people on a team you lead');
         }
       }
@@ -1556,12 +1605,12 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
       const departmentId = req.query.departmentId;
       if (!departmentId) return bad(res, 400, 'Choose a department');
       if (!await exists('departments', { _id: departmentId })) return bad(res, 404, 'Department not found');
-      if (!req.auth.isAdmin && !req.auth.departmentIds.includes(departmentId)) {
+      if (!req.auth.isAdmin && !req.auth.isManager && !req.auth.departmentIds.includes(departmentId)) {
         return bad(res, 403, 'You are not in that department');
       }
       const members = await findMany('user_departments', { department_id: departmentId });
       let assigneeIds = members.map((member) => member.user_id);
-      const seesWholeTeam = req.auth.isAdmin || req.auth.leadDepartmentIds.includes(departmentId);
+      const seesWholeTeam = req.auth.isAdmin || req.auth.isManager || req.auth.leadDepartmentIds.includes(departmentId);
       if (!seesWholeTeam) assigneeIds = assigneeIds.filter((userId) => userId === req.auth.id);
       filter = { assignee_id: { $in: assigneeIds } };
     }
@@ -1598,6 +1647,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
       }
     }
     rows.sort(byDue);
+    rows = await omitPrivateTasks(req.auth, rows);
     const hydrated = await hydrateTasks(rows);
     return res.json({
       tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart))),
@@ -1607,7 +1657,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
     });
   }
 
-  const rows = (await findMany('tasks', filter)).sort(byDue);
+  const rows = await omitPrivateTasks(req.auth, (await findMany('tasks', filter)).sort(byDue));
   const hydrated = await hydrateTasks(rows);
   res.json({
     tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart))),
@@ -1629,7 +1679,7 @@ app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
   const project = projectId ? await findOne('projects', { _id: projectId }) : null;
   const assigningSomeoneElse = assigneeId !== req.auth.id;
   if (assigningSomeoneElse) {
-    const allowed = project ? await canAssignOnProject(req.auth, project) : (req.auth.isAdmin || req.auth.isLead);
+    const allowed = project ? await canAssignOnProject(req.auth, project) : (req.auth.isAdmin || req.auth.isLead || req.auth.isManager);
     if (!allowed) return bad(res, 403, 'You can add this task for yourself');
   }
   const assignee = await activeUser(assigneeId);
@@ -1639,7 +1689,9 @@ app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
     if (project.status === 'done') return bad(res, 400, 'This project is marked done');
     const onProject = await isProjectMember(projectId, req.auth.id) || await canAssignOnProject(req.auth, project);
     if (!onProject) return bad(res, 403, 'Only people on the project can add their part');
-    if (!await isProjectMember(projectId, assigneeId)) return bad(res, 400, 'Add them to the project before assigning this task');
+    if (!await isProjectMember(projectId, assigneeId) && !req.auth.isAdmin && !req.auth.isManager) {
+      return bad(res, 400, 'Add them to the project before assigning this task');
+    }
   }
   try {
     const taskId = await withTx(async () => {
@@ -1654,6 +1706,9 @@ app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
         dueDate: req.body.dueDate,
         kind: projectId ? 'project' : 'personal',
       });
+      if (projectId && !await isProjectMember(projectId, assigneeId)) {
+        await insertIgnore('project_members', { _id: `${projectId}:${assigneeId}`, project_id: projectId, user_id: assigneeId });
+      }
       if (assigneeId !== req.auth.id) {
         await notify(assigneeId, `${req.auth.name} assigned “${title.value}” to you.`, createdId, projectId);
       }
@@ -1748,7 +1803,10 @@ app.post('/api/tasks/:id/comments', requireAuth, wrap(async (req, res) => {
 app.get('/api/trends', requireAuth, wrap(async (req, res) => {
   const userId = req.query.userId || req.auth.id;
   if (!await exists('users', { _id: userId, active: 1 })) return bad(res, 404, 'Person not found');
-  if (userId !== req.auth.id && !req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, userId)) {
+  if (userId !== req.auth.id && !seesConfidential(req.auth) && await isPrivateAssignee(userId)) {
+    return bad(res, 403, 'That board is private');
+  }
+  if (userId !== req.auth.id && !req.auth.isAdmin && !req.auth.isManager && !await assigneeInLeadDepts(req.auth, userId)) {
     return bad(res, 403, 'You can see trends for people on a team you lead');
   }
   const current = startOfWeek(new Date());
@@ -2015,8 +2073,8 @@ async function visibleTaskRequests(auth) {
 }
 
 async function visibleTimelineRequests(auth) {
-  if (!auth.isAdmin && !auth.leadDepartmentIds.length) return [];
-  const stored = await findMany('project_timelines', auth.isAdmin ? {} : { department_id: { $in: auth.leadDepartmentIds } });
+  if (!auth.isAdmin && !auth.isManager && !auth.leadDepartmentIds.length) return [];
+  const stored = await findMany('project_timelines', auth.isAdmin || auth.isManager ? {} : { department_id: { $in: auth.leadDepartmentIds } });
   if (!stored.length) return [];
   const projects = await findMany('projects', { _id: { $in: [...new Set(stored.map((row) => row.project_id))] } });
   const departments = await findMany('departments', { _id: { $in: [...new Set(stored.map((row) => row.department_id))] } });
@@ -2239,7 +2297,7 @@ app.post('/api/recurring', requireAuth, wrap(async (req, res) => {
   }
   const priority = PRIORITIES.has(req.body.priority) ? req.body.priority : 'medium';
   const assigneeId = req.body.assigneeId || req.auth.id;
-  if (!req.auth.isAdmin && assigneeId !== req.auth.id && !await assigneeInLeadDepts(req.auth, assigneeId)) {
+  if (!req.auth.isAdmin && !req.auth.isManager && assigneeId !== req.auth.id && !await assigneeInLeadDepts(req.auth, assigneeId)) {
     return bad(res, 403, 'You can add repeating tasks for yourself. Team leads can add them for their department.');
   }
   const assignee = await activeUser(assigneeId);
@@ -2249,7 +2307,13 @@ app.post('/api/recurring', requireAuth, wrap(async (req, res) => {
     const project = await findOne('projects', { _id: projectId });
     if (!project) return bad(res, 400, 'That project does not exist');
     if (project.status === 'done') return bad(res, 400, 'That project is marked done');
-    if (!await isProjectMember(projectId, assigneeId)) return bad(res, 400, 'That person is not on the project');
+    if (!await isProjectMember(projectId, assigneeId)) {
+      if (req.auth.isAdmin || req.auth.isManager) {
+        await insertIgnore('project_members', { _id: `${projectId}:${assigneeId}`, project_id: projectId, user_id: assigneeId });
+      } else {
+        return bad(res, 400, 'That person is not on the project');
+      }
+    }
   }
   const ruleId = id('rule');
   await insertOne('recurring_rules', {
@@ -2401,7 +2465,10 @@ app.get('/api/attendance', requireAuth, wrap(async (req, res) => {
   if (!/^\d{4}-\d{2}$/.test(month)) return bad(res, 400, 'Choose a month');
   const userId = req.query.userId || req.auth.id;
   if (!await exists('users', { _id: userId })) return bad(res, 404, 'Person not found');
-  if (userId !== req.auth.id && !req.auth.isAdmin && !await assigneeInLeadDepts(req.auth, userId)) {
+  if (userId !== req.auth.id && !seesConfidential(req.auth) && await isPrivateAssignee(userId)) {
+    return bad(res, 403, 'That attendance is private');
+  }
+  if (userId !== req.auth.id && !req.auth.isAdmin && !req.auth.isManager && !await assigneeInLeadDepts(req.auth, userId)) {
     return bad(res, 403, 'You can open attendance for people on a team you lead');
   }
   const { start, end } = monthBounds(month);

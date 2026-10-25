@@ -247,8 +247,21 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 .lanes { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 12px; min-height: 420px; overflow-x: auto; }
 .lane { background: rgba(255, 255, 255, 0.72); border-radius: 18px; padding: 8px; min-height: 420px; min-width: 0; }
 .lane.over { outline: 2px dashed var(--green); outline-offset: -6px; }
-.lane-head { display: flex; justify-content: space-between; padding: 8px 8px 10px; font-weight: 700; }
-.lane-head span { color: var(--muted); }
+.lane-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 8px 10px; font-weight: 700; }
+.lane-tools { display: flex; align-items: center; gap: 6px; color: var(--muted); font-weight: 700; }
+.lane-add {
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--green);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
 .lane-body { display: grid; gap: 8px; align-content: start; }
 .card {
   position: relative;

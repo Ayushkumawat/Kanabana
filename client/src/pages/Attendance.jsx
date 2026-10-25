@@ -59,11 +59,12 @@ export default function Attendance() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    if (!user.isAdmin && !user.isLead) return undefined;
+    if (!user.isAdmin && !user.isLead && !user.isManager) return undefined;
     api('/users')
       .then((data) => {
+        const wide = user.isAdmin || user.isManager;
         const list = data.users.filter((person) => person.active && (
-          user.isAdmin || person.id === user.id || person.departmentIds.some((id) => user.leadDepartmentIds.includes(id))
+          wide || person.id === user.id || (!person.isManager && person.departmentIds.some((id) => user.leadDepartmentIds.includes(id)))
         ));
         setPeople(list);
       })

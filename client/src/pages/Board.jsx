@@ -48,7 +48,7 @@ export default function Board({ scope, personId = '' }) {
   useEffect(() => {
     if (scope !== 'team' || departmentId || departments.length === 0) return;
     const mine = departments.find((item) => user.departmentIds.includes(item.id));
-    const options = user.isAdmin ? departments : departments.filter((item) => user.departmentIds.includes(item.id));
+    const options = user.isAdmin || user.isManager ? departments : departments.filter((item) => user.departmentIds.includes(item.id));
     setDepartmentId((mine || options[0] || departments[0]).id);
   }, [scope, departmentId, departments, user]);
 
@@ -93,7 +93,7 @@ export default function Board({ scope, personId = '' }) {
     };
   }, [scope, personId, user.id, tick]);
 
-  const teamOptions = user.isAdmin ? departments : departments.filter((item) => user.departmentIds.includes(item.id));
+  const teamOptions = user.isAdmin || user.isManager ? departments : departments.filter((item) => user.departmentIds.includes(item.id));
   const department = departments.find((item) => item.id === departmentId);
   const shown = tasks.filter((task) => {
     if (projectFilter === 'personal' && task.projectId) return false;
@@ -138,7 +138,7 @@ export default function Board({ scope, personId = '' }) {
 
   const viewed = people.find((person) => person.id === personId);
   const heading = scope === 'mine' ? 'My board' : scope === 'person' ? `${viewed?.name || 'Person'}’s board` : `${department?.name || 'Team'} board`;
-  const wholeTeam = scope !== 'team' || user.isAdmin || user.leadDepartmentIds.includes(departmentId);
+  const wholeTeam = scope !== 'team' || user.isAdmin || user.isManager || user.leadDepartmentIds.includes(departmentId);
   const attention = [
     ...previous.map((task) => ({ task, note: 'Last week' })),
     ...fromNext.map((task) => ({ task, note: 'Coming up' })),
@@ -221,7 +221,7 @@ export default function Board({ scope, personId = '' }) {
         </div>
       ) : null}
       <div className="board-body">
-        <Kanban tasks={shown} user={user} onOpen={setOpenId} onMove={moveTask} clashIds={clashes.ids} />
+        <Kanban tasks={shown} user={user} onOpen={setOpenId} onMove={moveTask} onAdd={() => setCreating(true)} clashIds={clashes.ids} />
         {attention.length || clashes.ids.size ? (
           <aside className="week-list">
             <h3>Needs a look</h3>

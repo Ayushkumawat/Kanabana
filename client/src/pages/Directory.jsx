@@ -18,7 +18,7 @@ export default function Directory() {
   const [reset, setReset] = useState(null);
   const [password, setPassword] = useState('');
   const [formError, setFormError] = useState('');
-  const [person, setPerson] = useState({ name: '', email: '', password: '', birthday: '', workAnniversary: '', departmentIds: [], leadDepartmentId: '' });
+  const [person, setPerson] = useState({ name: '', email: '', password: '', birthday: '', workAnniversary: '', departmentIds: [], leadDepartmentId: '', manager: false });
   const [department, setDepartment] = useState({ name: '', leadId: '' });
 
   function load() {
@@ -43,7 +43,7 @@ export default function Directory() {
         body: { ...person, leadDepartmentId: person.leadDepartmentId || null },
       });
       setPersonOpen(false);
-      setPerson({ name: '', email: '', password: '', birthday: '', workAnniversary: '', departmentIds: [], leadDepartmentId: '' });
+      setPerson({ name: '', email: '', password: '', birthday: '', workAnniversary: '', departmentIds: [], leadDepartmentId: '', manager: false });
       toast('Person added. They can sign in with that email.');
       await load();
     } catch (err) {
@@ -105,11 +105,11 @@ export default function Directory() {
                 </td>
                 <td>{personRow.email}</td>
                 <td>{personRow.departments.map((item) => item.name).join(', ')}</td>
-                <td>{personRow.isAdmin ? 'Admin' : personRow.leadOf.length ? `Lead · ${personRow.leadOf.map((item) => item.name).join(', ')}` : 'Member'}</td>
+                <td>{accountRole(personRow)}</td>
                 <td>{personRow.active ? 'Active' : 'Deactivated'}</td>
                 {user.isAdmin ? (
                   <td className="actions">
-                    <button type="button" className="btn ghost small" onClick={() => { setEdit({ ...personRow, departmentIds: personRow.departmentIds.slice() }); setFormError(''); }}>Edit</button>
+                    <button type="button" className="btn ghost small" onClick={() => { setEdit({ ...personRow, departmentIds: personRow.departmentIds.slice(), manager: Boolean(personRow.isManager) }); setFormError(''); }}>Edit</button>
                     <button type="button" className="btn ghost small" onClick={() => { setReset(personRow); setPassword(''); setFormError(''); }}>Reset password</button>
                     {personRow.departureLeads?.length ? (
                       <button
@@ -152,6 +152,22 @@ export default function Directory() {
             <Field label="Temporary password" hint="They can change it after signing in."><input type="text" value={person.password} onChange={(event) => setPerson({ ...person, password: event.target.value })} required minLength={8} /></Field>
             <Field label="Birthday"><input type="date" value={person.birthday} onChange={(event) => setPerson({ ...person, birthday: event.target.value })} required /></Field>
             <Field label="Work anniversary"><input type="date" value={person.workAnniversary} onChange={(event) => setPerson({ ...person, workAnniversary: event.target.value })} required /></Field>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={person.manager}
+                onChange={(event) => {
+                  const manager = event.target.checked;
+                  setPerson({
+                    ...person,
+                    manager,
+                    departmentIds: manager ? departments.map((item) => item.id) : person.departmentIds,
+                  });
+                }}
+              />
+              Manager
+            </label>
+            <p className="hint">Sees every project, every team board, and everyone’s board. Their own tasks stay off team boards and off People for team leads. Other managers can still open their board. They join every team.</p>
             <div className="field">
               <span>Departments</span>
               <div className="checks">
@@ -159,7 +175,8 @@ export default function Directory() {
                   <label key={item.id} className="check">
                     <input
                       type="checkbox"
-                      checked={person.departmentIds.includes(item.id)}
+                      checked={person.manager || person.departmentIds.includes(item.id)}
+                      disabled={person.manager}
                       onChange={() => {
                         const departmentIds = person.departmentIds.includes(item.id)
                           ? person.departmentIds.filter((id) => id !== item.id)
@@ -179,7 +196,7 @@ export default function Directory() {
             <Field label="Also make team lead of" hint="This replaces the current lead of that department.">
               <select value={person.leadDepartmentId} onChange={(event) => setPerson({ ...person, leadDepartmentId: event.target.value })}>
                 <option value="">Not a lead</option>
-                {departments.filter((item) => person.departmentIds.includes(item.id)).map((item) => (
+                {departments.filter((item) => person.manager || person.departmentIds.includes(item.id)).map((item) => (
                   <option key={item.id} value={item.id}>{item.name}{item.leadName ? ` (now ${item.leadName})` : ''}</option>
                 ))}
               </select>
@@ -220,7 +237,7 @@ export default function Directory() {
               try {
                 await api(`/users/${edit.id}`, {
                   method: 'PATCH',
-                  body: { name: edit.name, email: edit.email, departmentIds: edit.departmentIds, active: edit.active, birthday: edit.birthday, workAnniversary: edit.workAnniversary },
+                  body: { name: edit.name, email: edit.email, departmentIds: edit.manager ? departments.map((item) => item.id) : edit.departmentIds, active: edit.active, birthday: edit.birthday, workAnniversary: edit.workAnniversary, manager: Boolean(edit.manager) },
                 });
                 if (edit.id === user.id) await refresh();
                 setEdit(null);
@@ -234,6 +251,22 @@ export default function Directory() {
             <Field label="Email"><input type="email" value={edit.email} onChange={(event) => setEdit({ ...edit, email: event.target.value })} required /></Field>
             <Field label="Birthday"><input type="date" value={edit.birthday || ''} onChange={(event) => setEdit({ ...edit, birthday: event.target.value })} /></Field>
             <Field label="Work anniversary"><input type="date" value={edit.workAnniversary || ''} onChange={(event) => setEdit({ ...edit, workAnniversary: event.target.value })} /></Field>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={Boolean(edit.manager)}
+                onChange={(event) => {
+                  const manager = event.target.checked;
+                  setEdit({
+                    ...edit,
+                    manager,
+                    departmentIds: manager ? departments.map((item) => item.id) : edit.departmentIds,
+                  });
+                }}
+              />
+              Manager
+            </label>
+            <p className="hint">{edit.manager ? 'They stay on every team. Turn this off to choose teams. Their tasks stay hidden from team leads, and other managers can still see that board.' : 'Their tasks stay visible to their team lead. Check this to give them every team, every project, and every board.'}</p>
             <div className="field">
               <span>Departments</span>
               <div className="checks">
@@ -241,7 +274,8 @@ export default function Directory() {
                   <label key={item.id} className="check">
                     <input
                       type="checkbox"
-                      checked={edit.departmentIds.includes(item.id)}
+                      checked={edit.manager || edit.departmentIds.includes(item.id)}
+                      disabled={Boolean(edit.manager)}
                       onChange={() => setEdit({
                         ...edit,
                         departmentIds: edit.departmentIds.includes(item.id)
@@ -294,6 +328,14 @@ export default function Directory() {
       {!user.isAdmin ? <p className="hint">Signed in as {roleLabel(user)}. An admin creates logins and departments.</p> : null}
     </div>
   );
+}
+
+function accountRole(person) {
+  const parts = [];
+  if (person.isAdmin) parts.push('Admin');
+  if (person.isManager) parts.push('Manager');
+  if (person.leadOf.length) parts.push(`Lead · ${person.leadOf.map((item) => item.name).join(', ')}`);
+  return parts.length ? parts.join(' · ') : 'Member';
 }
 
 function DepartmentCard({ department, users, canManage, onSaved }) {

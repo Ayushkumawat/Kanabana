@@ -14,23 +14,24 @@ export default function People() {
   useEffect(() => {
     api('/users')
       .then((data) => {
+        const wide = user.isAdmin || user.isManager;
         const list = data.users.filter((person) => person.active && (
-          user.isAdmin || person.departmentIds.some((id) => user.leadDepartmentIds.includes(id))
+          wide || (!person.isManager && person.departmentIds.some((id) => user.leadDepartmentIds.includes(id)))
         ));
         setPeople(list);
         setSelected((current) => (list.some((person) => person.id === current) ? current : list[0]?.id || ''));
       })
       .catch((err) => setError(err.message));
-  }, [user.isAdmin, user.leadDepartmentIds]);
+  }, [user.isAdmin, user.isManager, user.leadDepartmentIds]);
 
-  if (!user.isAdmin && !user.isLead) return <Navigate to="/" replace />;
+  if (!user.isAdmin && !user.isLead && !user.isManager) return <Navigate to="/" replace />;
 
   return (
     <div className="stack">
       <div className="page-head">
         <div>
           <h1>People</h1>
-          <p className="lede">{user.isAdmin ? 'Open anyone’s board and see the week the way they see it.' : 'Open a board for someone on a team you lead.'}</p>
+          <p className="lede">{user.isAdmin || user.isManager ? 'Open anyone’s board and see the week the way they see it.' : 'Open a board for someone on a team you lead.'}</p>
         </div>
       </div>
       {error ? <p className="banner">{error}</p> : null}

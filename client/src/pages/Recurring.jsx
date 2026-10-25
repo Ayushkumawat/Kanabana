@@ -31,7 +31,7 @@ export default function Recurring() {
     api('/projects').then((data) => setProjects(data.projects.filter((project) => project.canAddTask && project.status !== 'done'))).catch(() => {});
   }, []);
 
-  const assignable = user.isAdmin
+  const assignable = user.isAdmin || user.isManager
     ? people
     : user.isLead
       ? people.filter((person) => person.id === user.id || person.departments.some((item) => user.leadDepartmentIds.includes(item.id)))

@@ -40,8 +40,10 @@ export async function scanOverdue() {
       'board',
     );
     told.add(assignee.id);
-    let leads = await leadsFor(assignee.id);
-    if (!leads.length && task.creator_id && task.creator_id !== assignee.id) {
+    let leads = assignee.manager
+      ? (await findMany('users', { active: 1 })).filter((user) => (user.manager || user.role === 'admin') && user.id !== assignee.id)
+      : await leadsFor(assignee.id);
+    if (!leads.length && task.creator_id && task.creator_id !== assignee.id && !assignee.manager) {
       const creator = users.get(task.creator_id) || await findOne('users', { _id: task.creator_id });
       if (creator?.active) leads = [creator];
     }
