@@ -123,7 +123,6 @@ export async function sendInvites(meeting, attendees) {
     ].join('\n');
     const ok = await sendMail({
       to: person.email,
-      copyFor: person,
       subject: `Meeting: ${meeting.title}`,
       text,
       html: inviteHtml({ meeting, when, names, meetUrl }),

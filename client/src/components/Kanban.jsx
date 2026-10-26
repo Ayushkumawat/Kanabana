@@ -80,7 +80,7 @@ export default function Kanban({ tasks, user, onOpen, onMove, onAdd, clashIds })
                     <div className="card-meta">
                       <span className={isOverdue(task) ? 'late' : ''}>{formatDay(task.dueDate)}</span>
                       <span>{task.projectName || 'Personal'}</span>
-                      {task.fromPreviousWeek ? <span className="late">Last week</span> : null}
+                      {task.fromPreviousWeek ? <span className="late">Carried over</span> : null}
                       {task.fromNextWeek ? <span>Later week</span> : null}
                       {task.waitingOn ? <span className="late">Waiting</span> : null}
                       {task.changeRequests?.includes('edit') ? <span className="ask">Edits requested</span> : null}

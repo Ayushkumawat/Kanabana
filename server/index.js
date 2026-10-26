@@ -152,7 +152,7 @@ async function shapeUsers(rows) {
       isAdmin: row.role === 'admin',
       isManager: Boolean(row.manager),
       isLead: leadOf.length > 0,
-      isHr: row.role === 'admin' || personDepartments.some((item) => item.name.toLowerCase() === 'hr'),
+      isHr: personDepartments.some((item) => isHrDepartment(item.name)),
       birthday: row.birthday || null,
       workAnniversary: row.work_anniversary || null,
       leadOf,
@@ -1543,12 +1543,12 @@ app.delete('/api/projects/:id/members/:userId', requireAuth, wrap(async (req, re
   res.json({ project: await presentProject(await findOne('projects', { _id: row.id }), req.auth, true) });
 }));
 
-function matchesWeek(task, weekStart, weekEnd, isCurrent, includePrevious, prevStart) {
+function matchesWeek(task, weekStart, weekEnd, isCurrent) {
   if (task.due_date >= weekStart && task.due_date <= weekEnd) return true;
   const completed = String(task.completed_at || '').slice(0, 10);
   if (task.status === 'done' && completed.length === 10 && completed >= weekStart && completed <= weekEnd) return true;
   if (isCurrent && task.due_date > weekEnd && task.status !== 'done' && task.parent_task_id) return true;
-  if (includePrevious && task.due_date >= prevStart && task.due_date < weekStart && task.status !== 'done') return true;
+  if (task.due_date && task.due_date < weekStart && ['upcoming', 'in_progress', 'review'].includes(task.status)) return true;
   return false;
 }
 
@@ -1575,7 +1575,6 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   let weekStart = null;
   let weekEnd = null;
   let isCurrent = false;
-  let previousWeekStart = null;
   let filter = {};
 
   if (scope === 'project') {
@@ -1590,9 +1589,6 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
     weekStart = isoDate(monday);
     weekEnd = isoDate(addDays(monday, 6));
     isCurrent = weekStart === isoDate(startOfWeek(new Date()));
-    const includePrevious = isCurrent && (scope === 'mine' || scope === 'person');
-    if (includePrevious) previousWeekStart = weekStart;
-    const prevStart = isoDate(addDays(monday, -7));
     await ensureRecurring(weekStart, weekEnd);
     if (scope === 'mine' || scope === 'person') {
       const assigneeId = scope === 'person' ? req.query.userId : req.auth.id;
@@ -1620,7 +1616,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
       filter = { assignee_id: { $in: assigneeIds } };
     }
     const candidates = await findMany('tasks', filter);
-    let rows = candidates.filter((task) => matchesWeek(task, weekStart, weekEnd, isCurrent, includePrevious, prevStart));
+    let rows = candidates.filter((task) => matchesWeek(task, weekStart, weekEnd, isCurrent));
     if (isCurrent && scope === 'team') {
       // Later work is added per person, and only when that person has nothing due
       // this week. A shared "no To do cards" check made one move hide other people.
@@ -1655,7 +1651,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
     rows = await omitPrivateTasks(req.auth, rows);
     const hydrated = await hydrateTasks(rows);
     return res.json({
-      tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart))),
+      tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, weekStart))),
       weekStart,
       weekEnd,
       isCurrent,
@@ -1665,7 +1661,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   const rows = await omitPrivateTasks(req.auth, (await findMany('tasks', filter)).sort(byDue));
   const hydrated = await hydrateTasks(rows);
   res.json({
-    tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, previousWeekStart))),
+    tasks: await withChangeRequests(hydrated.map((row) => mapTask(row, weekEnd, null))),
     weekStart,
     weekEnd: null,
     isCurrent,
@@ -1733,6 +1729,71 @@ async function createTeamTasks(req, res, { title, description, priority, project
   return res.status(201).json({ count: created.length });
 }
 
+async function createTasksForPeople(req, res, { title, description, priority, projectId, assigneeIds }) {
+  const allowed = req.auth.isAdmin || req.auth.isManager || req.auth.isLead;
+  if (!allowed) return bad(res, 403, 'You can add this task for yourself');
+  const project = projectId ? await findOne('projects', { _id: projectId }) : null;
+  if (projectId) {
+    if (!project) return bad(res, 404, 'Project not found');
+    if (project.status === 'done') return bad(res, 400, 'This project is marked done');
+    const onProject = await isProjectMember(projectId, req.auth.id) || await canAssignOnProject(req.auth, project);
+    if (!onProject) return bad(res, 403, 'Only people on the project can add their part');
+  } else if (!req.auth.isAdmin && !req.auth.isLead && !req.auth.isManager) {
+    return bad(res, 403, 'You can add this task for yourself');
+  }
+  const assignees = [];
+  for (const assigneeId of assigneeIds) {
+    const assignee = await activeUser(assigneeId);
+    if (!assignee) return bad(res, 400, 'Choose an active person');
+    if (assignee.manager && assignee.id !== req.auth.id && !req.auth.isAdmin && !req.auth.isManager) {
+      return bad(res, 403, 'That board is private');
+    }
+    if (projectId && !await isProjectMember(projectId, assignee.id) && !req.auth.isAdmin && !req.auth.isManager) {
+      return bad(res, 400, 'Add them to the project before assigning this task');
+    }
+    assignees.push(assignee);
+  }
+  const created = [];
+  for (const assignee of assignees) {
+    const taskId = await withTx(async () => {
+      const createdId = await insertTaskRow({
+        title: title.value,
+        description: description.value,
+        projectId,
+        creatorId: req.auth.id,
+        assigneeId: assignee.id,
+        status: 'upcoming',
+        priority,
+        dueDate: req.body.dueDate,
+        kind: projectId ? 'project' : 'personal',
+      });
+      if (projectId && !await isProjectMember(projectId, assignee.id)) {
+        await insertIgnore('project_members', {
+          _id: `${projectId}:${assignee.id}`,
+          project_id: projectId,
+          user_id: assignee.id,
+        });
+      }
+      if (assignee.id !== req.auth.id) {
+        await notify(assignee.id, `${req.auth.name} assigned “${title.value}” to you.`, createdId, projectId, 'board');
+      }
+      return createdId;
+    });
+    created.push({ assignee, taskId });
+  }
+  const names = assignees.map((person) => person.name).sort((left, right) => left.localeCompare(right)).join(', ');
+  await logActivity(req.auth.id, `${req.auth.name} assigned “${title.value}” to ${names}.`, created[0]?.taskId || null, projectId);
+  for (const item of created) {
+    if (item.assignee.id === req.auth.id) continue;
+    await sendAssignmentEmail(item.assignee, req.auth, {
+      title: title.value,
+      description: description.value,
+      dueDate: req.body.dueDate,
+    });
+  }
+  return res.status(201).json({ count: created.length });
+}
+
 app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
   const title = readText(req.body.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
@@ -1745,7 +1806,11 @@ app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
   if (departmentIds.length) {
     return createTeamTasks(req, res, { title, description, priority, projectId, departmentIds });
   }
-  const assigneeId = req.body.assigneeId || req.auth.id;
+  const assigneeIds = uniqueList(req.body.assigneeIds);
+  if (assigneeIds.length > 1) {
+    return createTasksForPeople(req, res, { title, description, priority, projectId, assigneeIds });
+  }
+  const assigneeId = assigneeIds[0] || req.body.assigneeId || req.auth.id;
   const project = projectId ? await findOne('projects', { _id: projectId }) : null;
   const assigningSomeoneElse = assigneeId !== req.auth.id;
   if (assigningSomeoneElse) {
@@ -2473,8 +2538,13 @@ app.delete('/api/recurring/:id', requireAuth, wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+function isHrDepartment(name) {
+  const value = String(name || '').trim().toLowerCase();
+  return value === 'hr' || value === 'human resource and admin';
+}
+
 async function hrUserIds() {
-  const departments = (await findMany('departments', {})).filter((department) => department.name.toLowerCase() === 'hr');
+  const departments = (await findMany('departments', {})).filter((department) => isHrDepartment(department.name));
   if (!departments.length) return [];
   const departmentIds = departments.map((department) => department.id);
   const links = await findMany('user_departments', { department_id: { $in: departmentIds } });
@@ -2486,7 +2556,7 @@ async function hrUserIds() {
 }
 
 function isHr(auth) {
-  return auth.isAdmin || auth.departments.some((item) => item.name.toLowerCase() === 'hr');
+  return auth.departments.some((item) => isHrDepartment(item.name));
 }
 
 function monthBounds(month) {
@@ -2566,7 +2636,7 @@ app.get('/api/chores', requireAuth, wrap(async (req, res) => {
       requesterName: requester.name,
     }];
   });
-  res.json({ chores, canClose: isHr(req.auth) });
+  res.json({ chores, canMove: isHr(req.auth) });
 }));
 
 app.post('/api/chores', requireAuth, wrap(async (req, res) => {
@@ -2596,14 +2666,17 @@ app.post('/api/chores', requireAuth, wrap(async (req, res) => {
   res.status(201).json({ ok: true });
 }));
 
-app.post('/api/chores/:id/done', requireAuth, wrap(async (req, res) => {
-  if (!isHr(req.auth)) return bad(res, 403, 'HR marks office requests done');
+app.post('/api/chores/:id/status', requireAuth, wrap(async (req, res) => {
+  if (!isHr(req.auth)) return bad(res, 403, 'Human Resource and Admin moves these requests');
+  const next = req.body.status;
+  if (!['open', 'in_progress', 'done'].includes(next)) return bad(res, 400, 'Choose open, in progress, or done');
   const chore = await findOne('office_chores', { _id: req.params.id });
   if (!chore) return bad(res, 404, 'Request not found');
-  if (chore.status !== 'done') {
-    await updateOne('office_chores', { _id: chore.id }, { status: 'done' });
+  if (chore.status !== next) {
+    await updateOne('office_chores', { _id: chore.id }, { status: next });
     if (chore.requester_id !== req.auth.id) {
-      await notify(chore.requester_id, `${req.auth.name} marked “${chore.title}” done.`, null, null, 'chores');
+      const label = next === 'done' ? 'done' : next === 'in_progress' ? 'in progress' : 'open';
+      await notify(chore.requester_id, `${req.auth.name} moved “${chore.title}” to ${label}.`, null, null, 'chores');
     }
   }
   res.json({ ok: true });

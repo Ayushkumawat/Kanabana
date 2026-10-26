@@ -116,7 +116,6 @@ export async function sendAssignmentEmail(person, actor, task) {
   if (!person?.email || !actor || person.id === actor.id) return false;
   return sendMail({
     to: person.email,
-    copyFor: person,
     subject: `New task: ${task.title}`,
     text: taskLines(actor.name, task),
   });
@@ -153,7 +152,6 @@ export async function sendDependencyEmail(person, actor, task, note) {
   lines.push('', 'Open Kanabana to clear it when you are done.');
   return sendMail({
     to: person.email,
-    copyFor: person,
     subject: `Help needed: ${task.title}`,
     text: lines.join('\n'),
   });

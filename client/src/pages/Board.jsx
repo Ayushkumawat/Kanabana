@@ -140,7 +140,7 @@ export default function Board({ scope, personId = '' }) {
   const heading = scope === 'mine' ? 'My board' : scope === 'person' ? `${viewed?.name || 'Person'}’s board` : `${department?.name || 'Team'} board`;
   const wholeTeam = scope !== 'team' || user.isAdmin || user.isManager || user.leadDepartmentIds.includes(departmentId);
   const attention = [
-    ...previous.map((task) => ({ task, note: 'Last week' })),
+    ...previous.map((task) => ({ task, note: 'Carried over' })),
     ...fromNext.map((task) => ({ task, note: 'Coming up' })),
     ...later.map((task) => ({ task, note: 'Follow-up' })),
   ];
@@ -153,7 +153,7 @@ export default function Board({ scope, personId = '' }) {
           <p className="lede">
             {scope === 'team' && !wholeTeam
               ? 'Your own tasks on this team. Your team lead sees everyone’s.'
-              : (monday === current ? 'This week, plus anything still open from last week.' : `Work due ${weekLabel(monday)}.`)}
+              : (monday === current ? 'This week, plus anything still open from earlier weeks.' : `Work due ${weekLabel(monday)}, plus anything still open from earlier.`)}
           </p>
         </div>
         {pane === 'work' ? <button type="button" className="btn primary" onClick={() => setCreating(true)}>Add task</button> : null}
@@ -186,7 +186,7 @@ export default function Board({ scope, personId = '' }) {
           <span className="stat">{openCount} open</span>
           <span className="stat">{inWeek.filter((task) => task.status === 'done').length} done</span>
           {overdueCount ? <span className="stat"><em>{overdueCount} overdue</em></span> : null}
-          {previous.length ? <span className="stat"><em>{previous.length} from last week</em></span> : null}
+          {previous.length ? <span className="stat"><em>{previous.length} carried over</em></span> : null}
           {fromNext.length ? <span className="stat">{fromNext.length} from next weeks</span> : null}
           {clashes.ids.size ? <span className="stat">{clashes.ids.size} clashing</span> : null}
           {later.length ? <span className="stat">{later.length} later</span> : null}
@@ -233,7 +233,7 @@ export default function Board({ scope, personId = '' }) {
             )) : null}
             {attention.map(({ task, note }) => (
               <button type="button" key={`${note}-${task.id}`} className="week-item" onClick={() => setOpenId(task.id)}>
-                <span className={`dot${note === 'Last week' ? ' overdue' : ''}`} />
+                <span className={`dot${note === 'Carried over' ? ' overdue' : ''}`} />
                 <span><strong>{task.title}</strong><small>{note} · {formatDay(task.dueDate)}</small></span>
               </button>
             ))}

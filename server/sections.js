@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import {
   count,
+  deleteMany,
   deleteOne,
   exists,
   findMany,
@@ -18,7 +19,7 @@ import {
   withTx,
 } from './db.js';
 import { audienceUsers, mustAck } from './announcements.js';
-import { copyAddresses, sendDependencyEmail } from './mail.js';
+import { sendDependencyEmail } from './mail.js';
 import { createGoogleMeet, deleteGoogleEvent, googleReady } from './google.js';
 import { isTime, sendInvites } from './meetings.js';
 import { deleteStored, existsStored, putStored, readStored, safeKey, storageConfigured } from './storage.js';
@@ -77,7 +78,7 @@ function saveFile(file, folder) {
 }
 
 function canOffice(auth) {
-  return auth.isAdmin || auth.isManager || auth.isLead || auth.isHr;
+  return auth.isAdmin || auth.isManager || auth.isLead;
 }
 
 function seesConfidential(auth) {
@@ -515,8 +516,8 @@ export function registerSections(app, ctx) {
   }));
 
   function hiringGate(req, res) {
-    if (!canOffice(req.auth)) {
-      bad(res, 403, 'Hiring is for team leads and HR');
+    if (!canOffice(req.auth) && !req.auth.isHr) {
+      bad(res, 403, 'Hiring is for Human Resource and Admin, team leads, and managers');
       return false;
     }
     return true;
@@ -685,6 +686,38 @@ export function registerSections(app, ctx) {
         // The previous file is already gone.
       }
     }
+    res.json({ ok: true });
+  }));
+
+  app.post('/api/hiring/resumes/:id/reviewer', requireAuth, wrap(async (req, res) => {
+    if (!hiringGate(req, res)) return undefined;
+    const row = await findOne('hiring_resumes', { _id: req.params.id });
+    if (!row) return bad(res, 404, 'Resume not found');
+    const reviewer = await activeUser(req.body.reviewerId);
+    if (!reviewer) return bad(res, 400, 'Choose who should review');
+    const status = row.status === 'new' ? 'in_review' : row.status;
+    await updateOne('hiring_resumes', { _id: row.id }, { reviewer_id: reviewer.id, status });
+    if (reviewer.id !== req.auth.id) {
+      await notify(reviewer.id, `${req.auth.name} asked you to review ${row.candidate_name}.`, null, null, 'hiring');
+    }
+    await logActivity(req.auth.id, `${req.auth.name} set ${reviewer.name} to review ${row.candidate_name}.`);
+    res.json({ ok: true });
+  }));
+
+  app.delete('/api/hiring/resumes/:id', requireAuth, wrap(async (req, res) => {
+    if (!hiringGate(req, res)) return undefined;
+    const row = await findOne('hiring_resumes', { _id: req.params.id });
+    if (!row) return bad(res, 404, 'Resume not found');
+    await deleteMany('hiring_checks', { resume_id: row.id });
+    if (row.file_stored) {
+      try {
+        await deleteStored(row.file_stored);
+      } catch {
+        // The file is already gone.
+      }
+    }
+    await deleteOne('hiring_resumes', { _id: row.id });
+    await logActivity(req.auth.id, `${req.auth.name} removed ${row.candidate_name}’s resume.`);
     res.json({ ok: true });
   }));
 
@@ -1072,26 +1105,9 @@ export function registerSections(app, ctx) {
       attendee_ids: userIds,
       created_at: now(),
     };
-    const guests = [];
-    const seenGuests = new Set();
-    for (const person of people) {
-      const email = String(person.email || '').trim();
-      const key = email.toLowerCase();
-      if (!email || seenGuests.has(key)) continue;
-      seenGuests.add(key);
-      guests.push({ email });
-    }
-    for (const person of people) {
-      for (const email of await copyAddresses(person)) {
-        const key = email.toLowerCase();
-        if (seenGuests.has(key)) continue;
-        seenGuests.add(key);
-        guests.push({ email, optional: true });
-      }
-    }
     let meet;
     try {
-      meet = await createGoogleMeet(meeting, guests);
+      meet = await createGoogleMeet(meeting, people);
     } catch (error) {
       return bad(res, error.status || 502, error.message);
     }

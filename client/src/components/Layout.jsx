@@ -28,7 +28,7 @@ const GROUPS = [
       { to: '/knowledge', label: 'Knowledge', area: 'knowledge' },
       { to: '/dependencies', label: 'Help', area: 'dependencies' },
       { to: '/tenders', label: 'Tenders', area: 'tenders', gate: 'office' },
-      { to: '/hiring', label: 'Hiring', area: 'hiring', gate: 'office' },
+      { to: '/hiring', label: 'Hiring', area: 'hiring', gate: 'hiring' },
     ],
   },
   {
@@ -47,7 +47,8 @@ const LINKS = GROUPS.flatMap((group) => group.links);
 function showLink(item, user) {
   if (!item.gate || user.isAdmin) return true;
   if (item.gate === 'lead') return user.isLead || user.isManager;
-  if (item.gate === 'office') return user.isLead || user.isHr || user.isManager;
+  if (item.gate === 'hiring') return user.isLead || user.isHr || user.isManager;
+  if (item.gate === 'office') return user.isLead || user.isManager;
   return false;
 }
 

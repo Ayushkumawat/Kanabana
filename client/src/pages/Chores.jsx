@@ -9,10 +9,17 @@ const CATEGORIES = [
   { id: 'purchasing', label: 'Purchasing' },
 ];
 
+const STEPS = [
+  { id: 'open', label: 'Open' },
+  { id: 'in_progress', label: 'In progress' },
+  { id: 'done', label: 'Done' },
+];
+
 export default function Chores() {
   const toast = useToast();
   const [chores, setChores] = useState([]);
-  const [canClose, setCanClose] = useState(false);
+  const [canMove, setCanMove] = useState(false);
+  const [moving, setMoving] = useState('');
   const [category, setCategory] = useState('maintenance');
   const [title, setTitle] = useState('');
   const [details, setDetails] = useState('');
@@ -24,7 +31,7 @@ export default function Chores() {
     return api('/chores')
       .then((data) => {
         setChores(data.chores);
-        setCanClose(data.canClose);
+        setCanMove(Boolean(data.canMove));
       })
       .catch((err) => setError(err.message));
   }
@@ -50,24 +57,28 @@ export default function Chores() {
     }
   }
 
-  async function closeChore(id) {
+  async function moveChore(item, status) {
+    if (item.status === status || moving) return;
+    setMoving(item.id);
     try {
-      await api(`/chores/${id}/done`, { method: 'POST' });
-      toast('Marked done');
+      await api(`/chores/${item.id}/status`, { method: 'POST', body: { status } });
+      toast(status === 'done' ? 'Marked done' : status === 'in_progress' ? 'Moved to in progress' : 'Moved to open');
       await load();
     } catch (err) {
       toast(err.message, 'bad');
+    } finally {
+      setMoving('');
     }
   }
 
-  const shown = chores.filter((item) => filter === 'all' || item.category === filter || (filter === 'open' && item.status === 'open'));
+  const shown = chores.filter((item) => filter === 'all' || item.category === filter || (filter === 'open' && item.status !== 'done'));
 
   return (
     <div className="stack">
       <div className="page-head">
         <div>
           <h1>Office chores</h1>
-          <p className="lede">Raise a maintenance or purchasing request. HR is notified. Everyone can see what has been raised.</p>
+          <p className="lede">Raise a maintenance or purchasing request. Everyone can see it. Human Resource and Admin can move it from open to in progress or done.</p>
         </div>
       </div>
       <form className="panel stack" onSubmit={submit}>
@@ -100,15 +111,28 @@ export default function Chores() {
           <article key={item.id} className="panel stack">
             <div className="row-between">
               <h3>{item.title}</h3>
-              <span className={`pill ${item.status === 'done' ? 'done' : 'upcoming'}`}>
-                {item.status === 'done' ? 'Done' : 'Open'}
-              </span>
+              {canMove ? (
+                <div className="segment" role="group" aria-label={`Move ${item.title}`}>
+                  {STEPS.map((step) => (
+                    <button
+                      type="button"
+                      key={step.id}
+                      className={item.status === step.id ? 'on' : ''}
+                      disabled={moving === item.id}
+                      onClick={() => moveChore(item, step.id)}
+                    >
+                      {step.label}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <span className={`pill ${item.status === 'done' ? 'done' : item.status === 'in_progress' ? 'in_progress' : 'upcoming'}`}>
+                  {STEPS.find((step) => step.id === item.status)?.label || 'Open'}
+                </span>
+              )}
             </div>
             <p className="muted">{CATEGORIES.find((entry) => entry.id === item.category)?.label} · {item.requesterName} · {formatWhen(item.createdAt)}</p>
             {item.details ? <p>{item.details}</p> : null}
-            {canClose && item.status !== 'done' ? (
-              <button type="button" className="btn small" onClick={() => closeChore(item.id)}>Mark done</button>
-            ) : null}
           </article>
         ))}
       </div>

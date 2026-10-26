@@ -290,6 +290,60 @@ function ReplaceResume({ busy, onFile }) {
   );
 }
 
+function ResumeMenu({ row, people, busy, onReplace, onReviewer, onDelete }) {
+  const [open, setOpen] = useState(false);
+  const [changing, setChanging] = useState(false);
+  const [reviewerId, setReviewerId] = useState(row.reviewerId || '');
+  const ref = useRef(null);
+
+  useEffect(() => {
+    function onDown(event) {
+      if (!ref.current?.contains(event.target)) {
+        setOpen(false);
+        setChanging(false);
+      }
+    }
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, []);
+
+  function close() {
+    setOpen(false);
+    setChanging(false);
+  }
+
+  return (
+    <div className="card-menu" ref={ref}>
+      <button type="button" className="dots" aria-label="Resume actions" aria-expanded={open} onClick={() => (open ? close() : setOpen(true))}>⋯</button>
+      {open ? (
+        <div className="menu-pop">
+          <ReplaceResume busy={busy} onFile={(file) => { close(); onReplace(file); }} />
+          {changing ? (
+            <form onSubmit={(event) => {
+              event.preventDefault();
+              if (!reviewerId) return;
+              close();
+              onReviewer(reviewerId);
+            }}>
+              <label>
+                Reviewer
+                <select value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} required>
+                  <option value="">Choose</option>
+                  {people.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}
+                </select>
+              </label>
+              <button className="btn small" disabled={busy || !reviewerId}>Done</button>
+            </form>
+          ) : (
+            <button type="button" className="btn small" disabled={busy} onClick={() => setChanging(true)}>Change reviewer</button>
+          )}
+          <button type="button" className="btn ghost small" disabled={busy} onClick={() => { close(); onDelete(); }}>Delete resume</button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSchedule, account, onAccount, departments, run, toast }) {
   const canSchedule = ['shortlisted', 'next_round'].includes(row.status) && (row.uploadedBy === user.id || data.isAdmin || data.isHr);
   const canOutcome = row.status === 'scheduled' && (row.reviewerId === user.id || row.uploadedBy === user.id || data.isAdmin || data.isHr);
@@ -306,6 +360,15 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
     const body = await readFile(file);
     closePreview();
     await run(() => api(`/hiring/resumes/${row.id}/file`, { method: 'POST', body: { file: body } }), 'Resume uploaded');
+  }
+
+  function changeReviewer(reviewerId) {
+    return run(() => api(`/hiring/resumes/${row.id}/reviewer`, { method: 'POST', body: { reviewerId } }), 'Reviewer updated');
+  }
+
+  function removeCard() {
+    if (!window.confirm(`Delete ${row.candidateName}'s resume card?`)) return undefined;
+    return run(() => api(`/hiring/resumes/${row.id}`, { method: 'DELETE' }), 'Resume removed');
   }
 
   async function openPreview() {
@@ -325,7 +388,17 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
     <article className="hire-card">
       <div className="row-between">
         <strong>{row.candidateName}</strong>
-        <span className="pill">{STATUS_LABEL[row.status] || row.status}{row.round > 1 ? ` · round ${row.round}` : ''}</span>
+        <div className="row-actions">
+          <span className="pill">{STATUS_LABEL[row.status] || row.status}{row.round > 1 ? ` · round ${row.round}` : ''}</span>
+          <ResumeMenu
+            row={row}
+            people={data.people}
+            busy={busy}
+            onReplace={replaceResume}
+            onReviewer={changeReviewer}
+            onDelete={removeCard}
+          />
+        </div>
       </div>
       {row.comment ? <p>{row.comment}</p> : null}
       <p className="muted">
@@ -335,7 +408,6 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
       </p>
       <div className="row-actions">
         <button type="button" className="btn small" onClick={openPreview}>View resume</button>
-        <ReplaceResume busy={busy} onFile={replaceResume} />
       </div>
       {row.fileAvailable === false ? <p className="error">The resume file is missing.</p> : null}
       {preview || previewError ? (
@@ -346,7 +418,6 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
               {previewError ? null : (
                 <button type="button" className="btn small" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>Download</button>
               )}
-              <ReplaceResume busy={busy} onFile={replaceResume} />
             </div>
           </div>
           {previewError ? <p className="error">{previewError}</p> : null}
