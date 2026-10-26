@@ -42,6 +42,7 @@ import { loadEnv } from './store.js';
 import { registerSections } from './sections.js';
 import { announcementPending } from './announcements.js';
 import { finishGoogleAuth, googleAuthUrl, googleReady } from './google.js';
+import { storageConfigured, storageLabel } from './storage.js';
 import { checkMail, sendAssignmentEmail } from './mail.js';
 import { startReminders } from './reminders.js';
 
@@ -2776,6 +2777,9 @@ async function main() {
   await prepareWeek();
   await checkMail();
   console.log(await googleReady() ? 'Google Calendar is connected' : 'Google Calendar is not connected');
+  console.log(storageConfigured()
+    ? `File storage is ready (${storageLabel()})`
+    : 'File storage is not configured. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.');
   startReminders();
   const officeAddresses = lanAddresses();
   if (officeAddresses[0]) publishOfficeName(officeAddresses[0]);

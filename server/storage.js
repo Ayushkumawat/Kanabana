@@ -10,20 +10,64 @@ const LEGACY = ['resumes', 'knowledge', 'reports', 'files'];
 
 let client;
 let clientRegion = '';
+let clientKey = '';
 
 function settings() {
   loadEnv();
   return {
     bucket: process.env.S3_BUCKET || 'kanabana',
-    region: process.env.S3_REGION || process.env.AWS_REGION || 'ap-south-1',
+    region: process.env.S3_REGION || 'ap-south-1',
+    accessKeyId: String(process.env.AWS_ACCESS_KEY_ID || '').trim(),
+    secretAccessKey: String(process.env.AWS_SECRET_ACCESS_KEY || '').trim(),
   };
 }
 
+export function storageConfigured() {
+  const { accessKeyId, secretAccessKey } = settings();
+  return Boolean(accessKeyId && secretAccessKey);
+}
+
+export function storageLabel() {
+  const { bucket, region } = settings();
+  return `${bucket} in ${region}`;
+}
+
+function refuseStorage() {
+  const error = new Error('This server cannot store files yet. Add the AWS storage keys on the hosted machine and restart.');
+  error.status = 503;
+  return error;
+}
+
+function explainStorage(error, action) {
+  const name = error?.name || '';
+  if (
+    !storageConfigured()
+    || name === 'CredentialsProviderError'
+    || name === 'InvalidAccessKeyId'
+    || name === 'SignatureDoesNotMatch'
+    || name === 'UnrecognizedClientException'
+    || name === 'AccessDenied'
+    || name === 'ExpiredToken'
+    || name === 'PermanentRedirect'
+  ) {
+    return refuseStorage();
+  }
+  const failure = new Error(action === 'save'
+    ? 'The file could not be saved. Try again in a moment.'
+    : 'The file could not be opened. Try again in a moment.');
+  failure.status = 502;
+  return failure;
+}
+
 function s3() {
-  const { region } = settings();
-  if (!client || clientRegion !== region) {
-    client = new S3Client({ region });
+  const { region, accessKeyId, secretAccessKey } = settings();
+  if (!client || clientRegion !== region || clientKey !== accessKeyId) {
+    client = new S3Client({
+      region,
+      credentials: { accessKeyId, secretAccessKey },
+    });
     clientRegion = region;
+    clientKey = accessKeyId;
   }
   return client;
 }
@@ -57,6 +101,7 @@ export async function putStored(folder, filename, body, contentType) {
     error.status = 500;
     throw error;
   }
+  if (!storageConfigured()) throw refuseStorage();
   const key = `${folder}/${filename}`;
   const { bucket } = settings();
   try {
@@ -67,10 +112,9 @@ export async function putStored(folder, filename, body, contentType) {
       ContentType: contentType || 'application/octet-stream',
     }));
   } catch (error) {
+    if (error.status) throw error;
     console.error(`Could not store ${key}: ${error.name || 'error'}`);
-    const failure = new Error('The file could not be saved. Try again in a moment.');
-    failure.status = 502;
-    throw failure;
+    throw explainStorage(error, 'save');
   }
   return key;
 }
@@ -86,6 +130,7 @@ async function localFile(key) {
 export async function readStored(raw) {
   const key = safeKey(raw);
   if (!key) return null;
+  if (!storageConfigured()) throw refuseStorage();
   const { bucket } = settings();
   for (const candidate of candidates(key)) {
     try {
@@ -94,10 +139,9 @@ export async function readStored(raw) {
       return { key: candidate, bytes, contentType: res.ContentType || 'application/octet-stream' };
     } catch (error) {
       if (missing(error)) continue;
+      if (error.status) throw error;
       console.error(`Could not read ${candidate}: ${error.name || 'error'}`);
-      const failure = new Error('The file could not be opened. Try again in a moment.');
-      failure.status = 502;
-      throw failure;
+      throw explainStorage(error, 'read');
     }
   }
   const bytes = await localFile(key);
@@ -118,7 +162,7 @@ export async function readStored(raw) {
 
 export async function existsStored(raw) {
   const key = safeKey(raw);
-  if (!key) return '';
+  if (!key || !storageConfigured()) return '';
   const { bucket } = settings();
   for (const candidate of candidates(key)) {
     try {
@@ -126,10 +170,9 @@ export async function existsStored(raw) {
       return candidate;
     } catch (error) {
       if (missing(error)) continue;
+      if (error.status) throw error;
       console.error(`Could not find ${candidate}: ${error.name || 'error'}`);
-      const failure = new Error('The file could not be opened. Try again in a moment.');
-      failure.status = 502;
-      throw failure;
+      throw explainStorage(error, 'read');
     }
   }
   const bytes = await localFile(key);

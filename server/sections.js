@@ -21,7 +21,7 @@ import { audienceUsers, mustAck } from './announcements.js';
 import { copyAddresses, sendDependencyEmail } from './mail.js';
 import { createGoogleMeet, deleteGoogleEvent, googleReady } from './google.js';
 import { isTime, sendInvites } from './meetings.js';
-import { deleteStored, existsStored, putStored, readStored, safeKey } from './storage.js';
+import { deleteStored, existsStored, putStored, readStored, safeKey, storageConfigured } from './storage.js';
 
 const fileTickets = new Map();
 const FILE_TYPES = {
@@ -529,7 +529,7 @@ export function registerSections(app, ctx) {
       try {
         fileAvailable = Boolean(await existsStored(row.file_stored));
       } catch {
-        fileAvailable = true;
+        fileAvailable = false;
       }
     }
     return {
@@ -598,6 +598,7 @@ export function registerSections(app, ctx) {
       people,
       isHr: isHr(req.auth),
       isAdmin: req.auth.isAdmin,
+      storageReady: storageConfigured(),
     });
   }));
 

@@ -1,6 +1,6 @@
 # Deploy Kanabana
 
-Kanabana runs as one container. The browser and the API share port 4050. Accounts, projects, and tasks live in MongoDB Atlas. Uploaded files stay in `server/data/uploads` on the VM.
+Kanabana runs as one container. The browser and the API share port 4050. Accounts, projects, and tasks live in MongoDB Atlas. Resumes, KT documents, and screenshots are stored in the private S3 bucket `kanabana` in `ap-south-1`. They are not kept in the container.
 
 ## 1. Create the Atlas cluster
 
@@ -50,7 +50,13 @@ Edit `.env`:
 MONGODB_URI=mongodb+srv://kanabana:YOUR_PASSWORD@kanabana.xxxxx.mongodb.net/?retryWrites=true&w=majority
 MONGODB_DB=kanabana
 JWT_SECRET=paste-a-long-random-string
+AWS_ACCESS_KEY_ID=the-same-key-used-on-the-office-computer
+AWS_SECRET_ACCESS_KEY=the-same-secret-used-on-the-office-computer
+S3_BUCKET=kanabana
+S3_REGION=ap-south-1
 ```
+
+Copy those four storage lines from the office computer’s `.env`. A hosted machine without them can sign people in, but resume and KT uploads fail. Do not commit the values.
 
 Generate a secret with `openssl rand -base64 32`. `.env` is not committed.
 
@@ -73,7 +79,7 @@ The SQLite file is left where it is, as a backup. The running app no longer read
 
 ## 7. Run it on the VM
 
-Install Docker and the Docker Compose plugin on the VM. Copy the repo and the `.env` file onto the VM (do not commit `.env`). Also copy `server/data/uploads` if that folder has files.
+Install Docker and the Docker Compose plugin on the VM. Copy the repo and the `.env` file onto the VM (do not commit `.env`). The hosted `.env` needs the same `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, and `S3_REGION` as the office computer. After `docker compose up -d --build`, the log should say `File storage is ready (kanabana in ap-south-1)`.
 
 ```bash
 docker compose up -d --build

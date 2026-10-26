@@ -69,6 +69,7 @@ export default function Hiring() {
           <p className="lede">Open positions by department. Add resumes, ask someone to review them, schedule interviews, then ask admin to create the account.</p>
         </div>
       </div>
+      {data.storageReady === false ? <p className="banner">This server cannot store resumes yet. Add the AWS storage keys on the hosted machine and restart it.</p> : null}
       {error ? <p className="banner">{error}</p> : null}
       <form className="panel stack" onSubmit={(event) => {
         event.preventDefault();
