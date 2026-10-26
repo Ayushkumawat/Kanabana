@@ -129,7 +129,7 @@ export default function TaskDrawer({ taskId, people, projects, onClose, onChange
               <div className="banner wait">{removal.requesterName} asked to delete this. {removal.note}</div>
             ) : null}
             {moves.length ? (
-              <Field label="Move to" hint={governs ? 'You can mark this done.' : 'To do, then In progress, then Review. Your team lead marks it done.'}>
+              <Field label="Move to" hint={governs ? 'You can mark this done.' : 'Move between To do and In progress, then send it to Review. Your team lead marks it done.'}>
                 <select
                   value={task.status}
                   disabled={busy}

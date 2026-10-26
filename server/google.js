@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { AUTO_NOTE } from './mail.js';
 import { loadEnv } from './store.js';
 
 const tokenPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'google-calendar.json');
@@ -139,26 +140,28 @@ function meetUrlFrom(event) {
     || '';
 }
 
-export async function createGoogleMeet(meeting) {
+async function insertEvent(meeting, attendees, sendUpdates) {
   const token = await accessToken();
-  const res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1&sendUpdates=none', {
+  const body = {
+    summary: meeting.title,
+    description: `${meeting.agenda}\n\n${AUTO_NOTE}`,
+    start: { dateTime: `${meeting.day}T${meeting.start_time}:00`, timeZone: 'Asia/Kolkata' },
+    end: { dateTime: `${meeting.day}T${meeting.end_time}:00`, timeZone: 'Asia/Kolkata' },
+    conferenceData: {
+      createRequest: {
+        requestId: `${meeting.id}-${sendUpdates}`,
+        conferenceSolutionKey: { type: 'hangoutsMeet' },
+      },
+    },
+  };
+  if (attendees.length) body.attendees = attendees;
+  const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1&sendUpdates=${sendUpdates}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      summary: meeting.title,
-      description: meeting.agenda,
-      start: { dateTime: `${meeting.day}T${meeting.start_time}:00`, timeZone: 'Asia/Kolkata' },
-      end: { dateTime: `${meeting.day}T${meeting.end_time}:00`, timeZone: 'Asia/Kolkata' },
-      conferenceData: {
-        createRequest: {
-          requestId: meeting.id,
-          conferenceSolutionKey: { type: 'hangoutsMeet' },
-        },
-      },
-    }),
+    body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -172,7 +175,22 @@ export async function createGoogleMeet(meeting) {
   if (!/^https:\/\/meet\.google\.com\//.test(meetUrl)) {
     throw fail('Google Calendar did not return a Meet link.');
   }
-  return { meetUrl, eventId: data.id || '' };
+  return { meetUrl, eventId: data.id || '', invited: sendUpdates === 'all' };
+}
+
+export async function createGoogleMeet(meeting, attendees = []) {
+  const people = attendees
+    .filter((person) => person?.email)
+    .map((person) => ({ email: person.email, optional: Boolean(person.optional) }));
+  if (people.length) {
+    try {
+      return await insertEvent(meeting, people, 'all');
+    } catch (error) {
+      if (error.message !== 'Google Meet could not be created.') throw error;
+      console.error('Google could not invite the attendees directly, so the office email will send the invitation.');
+    }
+  }
+  return insertEvent(meeting, [], 'none');
 }
 
 export async function deleteGoogleEvent(eventId) {

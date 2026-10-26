@@ -18,7 +18,7 @@ import {
   withTx,
 } from './db.js';
 import { audienceUsers, mustAck } from './announcements.js';
-import { sendDependencyEmail } from './mail.js';
+import { copyAddresses, sendDependencyEmail } from './mail.js';
 import { createGoogleMeet, deleteGoogleEvent, googleReady } from './google.js';
 import { isTime, sendInvites } from './meetings.js';
 import { deleteStored, existsStored, putStored, readStored, safeKey } from './storage.js';
@@ -1071,20 +1071,41 @@ export function registerSections(app, ctx) {
       attendee_ids: userIds,
       created_at: now(),
     };
+    const guests = [];
+    const seenGuests = new Set();
+    for (const person of people) {
+      const email = String(person.email || '').trim();
+      const key = email.toLowerCase();
+      if (!email || seenGuests.has(key)) continue;
+      seenGuests.add(key);
+      guests.push({ email });
+    }
+    for (const person of people) {
+      for (const email of await copyAddresses(person)) {
+        const key = email.toLowerCase();
+        if (seenGuests.has(key)) continue;
+        seenGuests.add(key);
+        guests.push({ email, optional: true });
+      }
+    }
     let meet;
     try {
-      meet = await createGoogleMeet(meeting);
+      meet = await createGoogleMeet(meeting, guests);
     } catch (error) {
       return bad(res, error.status || 502, error.message);
     }
     meeting.meet_url = meet.meetUrl;
     meeting.google_event_id = meet.eventId;
     await insertOne('meetings', meeting);
-    const result = await sendInvites(meeting, people);
-    if (!result.sent) {
-      await deleteOne('meetings', { _id: meeting.id });
-      await deleteGoogleEvent(meet.eventId);
-      return bad(res, 502, 'The invitation email could not be sent. Check the mail settings and try again.');
+    let warning = '';
+    if (!meet.invited) {
+      const result = await sendInvites(meeting, people);
+      if (!result.sent) {
+        await deleteOne('meetings', { _id: meeting.id });
+        await deleteGoogleEvent(meet.eventId);
+        return bad(res, 502, 'The invitation email could not be sent. Check the mail settings and try again.');
+      }
+      warning = result.failed.length ? `Saved, but the invitation did not reach ${result.failed.join(', ')}.` : '';
     }
     await logActivity(req.auth.id, `${req.auth.name} scheduled “${title.value}”.`);
     for (const person of people) {
@@ -1093,7 +1114,7 @@ export function registerSections(app, ctx) {
     }
     res.status(201).json({
       id: meeting.id,
-      warning: result.failed.length ? `Saved, but the invitation did not reach ${result.failed.join(', ')}.` : '',
+      warning,
     });
   }));
 }

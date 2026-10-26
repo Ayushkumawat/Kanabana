@@ -157,7 +157,7 @@ export default function ProjectDetail() {
         <p className="hint">
           {project.canAssign
             ? 'Assign a task to someone on this project. It shows up in their To do. You mark it done after they send it to review.'
-            : 'Your task starts in To do. Move it to In progress, then to Review. Your team lead marks it done. To edit or delete it, ask them and say which one.'}
+            : 'Your task starts in To do. Move it between To do and In progress, then send it to Review. Your team lead marks it done. To edit or delete it, ask them and say which one.'}
         </p>
       )}
       <div className="split">

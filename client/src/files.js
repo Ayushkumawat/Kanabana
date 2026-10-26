@@ -1,6 +1,9 @@
 import { getToken } from './api';
 
 export function readFile(file) {
+  if (file.size > 8 * 1024 * 1024) {
+    return Promise.reject(new Error('Keep the file under 8 MB'));
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {

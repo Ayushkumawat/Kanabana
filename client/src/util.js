@@ -153,7 +153,7 @@ export function allowedMoves(user, task) {
   if (canGovernTask(user, task)) return COLUMNS.map((column) => column.id).filter((id) => id !== task.status);
   if (user.id !== task.assigneeId) return [];
   if (task.status === 'upcoming') return ['in_progress'];
-  if (task.status === 'in_progress') return ['review'];
+  if (task.status === 'in_progress') return ['upcoming', 'review'];
   return [];
 }
 

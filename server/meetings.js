@@ -1,4 +1,4 @@
-import { mailFrom, sendMail } from './mail.js';
+import { AUTO_NOTE, mailFrom, sendMail } from './mail.js';
 
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -65,7 +65,7 @@ export function buildInvite({ meeting, attendees }) {
   const start = officeInstant(meeting.day, meeting.start_time);
   const end = officeInstant(meeting.day, meeting.end_time);
   const meetUrl = meeting.meet_url || '';
-  const description = meetUrl ? `${meeting.agenda}\n\nJoin Google Meet: ${meetUrl}` : meeting.agenda;
+  const description = [meeting.agenda, meetUrl ? `Join Google Meet: ${meetUrl}` : '', AUTO_NOTE].filter(Boolean).join('\n\n');
   const lines = [
     'BEGIN:VCALENDAR',
     'PRODID:-//Kanabana//Meetings//EN',
@@ -123,6 +123,7 @@ export async function sendInvites(meeting, attendees) {
     ].join('\n');
     const ok = await sendMail({
       to: person.email,
+      copyFor: person,
       subject: `Meeting: ${meeting.title}`,
       text,
       html: inviteHtml({ meeting, when, names, meetUrl }),

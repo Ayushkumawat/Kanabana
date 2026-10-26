@@ -268,20 +268,24 @@ function ResumeView({ url }) {
 }
 
 function ReplaceResume({ busy, onFile }) {
+  const inputRef = useRef(null);
   return (
-    <label className="btn small replace-resume">
-      Re-upload resume
+    <>
+      <button type="button" className="btn small" disabled={busy} onClick={() => inputRef.current?.click()}>
+        Re-upload resume
+      </button>
       <input
+        ref={inputRef}
         type="file"
         accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.png,.jpg,.jpeg,.txt,.md,.zip"
-        disabled={busy}
+        hidden
         onChange={(event) => {
           const file = event.target.files?.[0] || null;
           event.target.value = '';
           if (file) onFile(file);
         }}
       />
-    </label>
+    </>
   );
 }
 
@@ -330,16 +334,19 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
       </p>
       <div className="row-actions">
         <button type="button" className="btn small" onClick={openPreview}>View resume</button>
-        {row.fileAvailable === false ? <ReplaceResume busy={busy} onFile={replaceResume} /> : null}
+        <ReplaceResume busy={busy} onFile={replaceResume} />
       </div>
       {row.fileAvailable === false ? <p className="error">The resume file is missing.</p> : null}
       {preview || previewError ? (
         <Modal title={row.candidateName} className="resume" onClose={closePreview}>
           <div className="resume-bar">
             <p className="muted">{row.fileName}</p>
-            {previewError ? <ReplaceResume busy={busy} onFile={replaceResume} /> : (
-              <button type="button" className="btn small" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>Download</button>
-            )}
+            <div className="row-actions">
+              {previewError ? null : (
+                <button type="button" className="btn small" onClick={() => downloadFile(row.fileStored, row.fileName).catch((err) => toast(err.message, 'bad'))}>Download</button>
+              )}
+              <ReplaceResume busy={busy} onFile={replaceResume} />
+            </div>
           </div>
           {previewError ? <p className="error">{previewError}</p> : null}
           {preview?.loading ? <p className="muted">Opening the resume…</p> : null}

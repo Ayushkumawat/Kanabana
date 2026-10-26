@@ -27,8 +27,13 @@ export default function Meetings() {
   }
 
   useEffect(() => {
-    load().catch((err) => setError(err.message));
+    function refresh() {
+      if (document.visibilityState === 'visible') load().catch((err) => setError(err.message));
+    }
+    refresh();
+    document.addEventListener('visibilitychange', refresh);
     api('/users').then((data) => setPeople(data.users.filter((person) => person.active && person.id !== user.id))).catch(() => {});
+    return () => document.removeEventListener('visibilitychange', refresh);
   }, [user.id]);
 
   function toggle(id) {

@@ -65,7 +65,11 @@ app.use((_req, res, next) => {
   next();
 });
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '20mb' }));
+app.use('/api', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 function wrap(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -1667,6 +1671,67 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
   });
 }));
 
+async function createTeamTasks(req, res, { title, description, priority, projectId, departmentIds }) {
+  if (departmentIds.some((departmentId) => !req.auth.leadDepartmentIds.includes(departmentId))) {
+    return bad(res, 403, 'You can assign a whole team only for a department you lead');
+  }
+  const departments = await findMany('departments', { _id: { $in: departmentIds } });
+  if (departments.length !== departmentIds.length) return bad(res, 400, 'Choose a team you lead');
+  const project = projectId ? await findOne('projects', { _id: projectId }) : null;
+  if (projectId) {
+    if (!project) return bad(res, 404, 'Project not found');
+    if (project.status === 'done') return bad(res, 400, 'This project is marked done');
+    if (!await canAssignOnProject(req.auth, project)) return bad(res, 403, 'You can’t assign this project to the whole team');
+  }
+  const links = await findMany('user_departments', { department_id: { $in: departmentIds } });
+  const ids = [...new Set([
+    ...links.map((link) => link.user_id),
+    ...departments.map((department) => department.lead_id).filter(Boolean),
+  ])];
+  const users = ids.length ? await findMany('users', { _id: { $in: ids }, active: 1 }) : [];
+  const assignees = users.filter((user) => user.id === req.auth.id || !user.manager);
+  if (!assignees.length) return bad(res, 400, 'That team has no one to assign');
+  const created = [];
+  for (const assignee of assignees) {
+    const taskId = await withTx(async () => {
+      const createdId = await insertTaskRow({
+        title: title.value,
+        description: description.value,
+        projectId,
+        creatorId: req.auth.id,
+        assigneeId: assignee.id,
+        status: 'upcoming',
+        priority,
+        dueDate: req.body.dueDate,
+        kind: projectId ? 'project' : 'personal',
+      });
+      if (projectId && !await isProjectMember(projectId, assignee.id)) {
+        await insertIgnore('project_members', {
+          _id: `${projectId}:${assignee.id}`,
+          project_id: projectId,
+          user_id: assignee.id,
+        });
+      }
+      if (assignee.id !== req.auth.id) {
+        await notify(assignee.id, `${req.auth.name} assigned “${title.value}” to you.`, createdId, projectId, 'board');
+      }
+      return createdId;
+    });
+    created.push({ assignee, taskId });
+  }
+  const names = departments.map((department) => department.name).sort((left, right) => left.localeCompare(right)).join(', ');
+  await logActivity(req.auth.id, `${req.auth.name} assigned “${title.value}” to everyone in ${names}.`, created[0]?.taskId || null, projectId);
+  for (const item of created) {
+    if (item.assignee.id === req.auth.id) continue;
+    await sendAssignmentEmail(item.assignee, req.auth, {
+      title: title.value,
+      description: description.value,
+      dueDate: req.body.dueDate,
+    });
+  }
+  return res.status(201).json({ count: created.length });
+}
+
 app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
   const title = readText(req.body.title, 140, 'a title', true);
   if (title.error) return bad(res, 400, title.error);
@@ -1675,6 +1740,10 @@ app.post('/api/tasks', requireAuth, wrap(async (req, res) => {
   if (!isISODate(req.body.dueDate)) return bad(res, 400, 'Choose a due date');
   const priority = PRIORITIES.has(req.body.priority) ? req.body.priority : 'medium';
   const projectId = req.body.projectId || null;
+  const departmentIds = uniqueList(req.body.departmentIds);
+  if (departmentIds.length) {
+    return createTeamTasks(req, res, { title, description, priority, projectId, departmentIds });
+  }
   const assigneeId = req.body.assigneeId || req.auth.id;
   const project = projectId ? await findOne('projects', { _id: projectId }) : null;
   const assigningSomeoneElse = assigneeId !== req.auth.id;
@@ -1928,11 +1997,11 @@ app.patch('/api/tasks/:id/status', requireAuth, wrap(async (req, res) => {
     const governs = await canGovernTask(req.auth, task);
     const ownStep = req.auth.id === task.assignee_id && (
       (task.status === 'upcoming' && next === 'in_progress')
-      || (task.status === 'in_progress' && next === 'review')
+      || (task.status === 'in_progress' && (next === 'upcoming' || next === 'review'))
     );
     if (!governs && !ownStep) {
       if (next === 'done') return bad(res, 403, 'Your team lead marks this done after review');
-      return bad(res, 403, 'Move this from To do to In progress, then to Review for your team lead');
+      return bad(res, 403, 'Move this between To do and In progress, then send it to Review for your team lead');
     }
     if (next === 'done') {
       const waiting = await openDependencyBlock(task.id);
@@ -2649,6 +2718,9 @@ app.use((error, _req, res, _next) => {
   if (res.headersSent) return;
   if (error?.code === 11000 || String(error?.message || '').includes('UNIQUE')) {
     return res.status(400).json({ error: 'That value is already in use' });
+  }
+  if (error?.type === 'entity.too.large' || error?.status === 413) {
+    return res.status(413).json({ error: 'That file is too large. Keep it under 8 MB.' });
   }
   res.status(500).json({ error: 'Something went wrong' });
 });
