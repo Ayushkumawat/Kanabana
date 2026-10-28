@@ -605,6 +605,7 @@ export function registerSections(app, ctx) {
 
   app.post('/api/hiring/positions', requireAuth, wrap(async (req, res) => {
     if (!hiringGate(req, res)) return undefined;
+    if (!isHr(req.auth)) return bad(res, 403, 'Human Resource and Admin opens positions');
     const title = readText(req.body.title, 120, 'a position', true);
     if (title.error) return bad(res, 400, title.error);
     const description = readText(req.body.description, 2000, 'a description');
@@ -629,6 +630,7 @@ export function registerSections(app, ctx) {
 
   app.post('/api/hiring/resumes', requireAuth, wrap(async (req, res) => {
     if (!hiringGate(req, res)) return undefined;
+    if (!isHr(req.auth)) return bad(res, 403, 'Human Resource and Admin adds resumes');
     const position = await findOne('hiring_positions', { _id: req.body.positionId });
     if (!position || position.status !== 'open') return bad(res, 400, 'Choose an open position');
     const candidate = readText(req.body.candidateName, 80, 'the candidate’s name', true);
@@ -718,6 +720,38 @@ export function registerSections(app, ctx) {
     }
     await deleteOne('hiring_resumes', { _id: row.id });
     await logActivity(req.auth.id, `${req.auth.name} removed ${row.candidate_name}’s resume.`);
+    res.json({ ok: true });
+  }));
+
+  function hiringBucket(status) {
+    if (status === 'new' || status === 'in_review') return 'pending';
+    if (status === 'passed' || status === 'discarded') return 'rejected';
+    return 'selected';
+  }
+
+  app.post('/api/hiring/resumes/:id/decision', requireAuth, wrap(async (req, res) => {
+    if (!hiringGate(req, res)) return undefined;
+    const row = await findOne('hiring_resumes', { _id: req.params.id });
+    if (!row) return bad(res, 404, 'Resume not found');
+    if (row.reviewer_id !== req.auth.id && !req.auth.isAdmin && !isHr(req.auth)) {
+      return bad(res, 403, 'The reviewer moves this resume');
+    }
+    const decision = req.body.decision;
+    if (!['pending', 'selected', 'rejected'].includes(decision)) return bad(res, 400, 'Choose selected, not selected, or review pending');
+    if (hiringBucket(row.status) === decision) return res.json({ ok: true });
+    const position = await findOne('hiring_positions', { _id: row.position_id });
+    const role = position?.title || 'the role';
+    if (decision === 'pending') {
+      await updateOne('hiring_resumes', { _id: row.id }, { status: 'in_review' });
+    } else if (decision === 'selected') {
+      await updateOne('hiring_resumes', { _id: row.id }, { status: 'shortlisted' });
+      if (row.uploaded_by !== req.auth.id) {
+        await notify(row.uploaded_by, `${row.candidate_name} is selected for interview for ${role}. Add the meet link, date, and time.`, null, null, 'hiring');
+      }
+    } else {
+      await updateOne('hiring_resumes', { _id: row.id }, { status: 'passed' });
+    }
+    await logActivity(req.auth.id, `${req.auth.name} marked ${row.candidate_name} as ${decision === 'pending' ? 'review pending' : decision === 'selected' ? 'selected' : 'not selected'} for ${role}.`);
     res.json({ ok: true });
   }));
 

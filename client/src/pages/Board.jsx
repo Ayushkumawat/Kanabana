@@ -77,7 +77,7 @@ export default function Board({ scope, personId = '' }) {
   }, [scope, monday, departmentId, personId, tick]);
 
   useEffect(() => {
-    if (scope === 'team') return undefined;
+    if (!showTrends || scope === 'team') return undefined;
     if (scope === 'person' && !personId) return undefined;
     let cancel = false;
     const userId = scope === 'person' ? personId : user.id;
@@ -91,7 +91,7 @@ export default function Board({ scope, personId = '' }) {
     return () => {
       cancel = true;
     };
-  }, [scope, personId, user.id, tick]);
+  }, [showTrends, scope, personId, user.id]);
 
   const teamOptions = user.isAdmin || user.isManager ? departments : departments.filter((item) => user.departmentIds.includes(item.id));
   const department = departments.find((item) => item.id === departmentId);

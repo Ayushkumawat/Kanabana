@@ -3,7 +3,6 @@ import {
   findMany,
   findOne,
   id,
-  insertIgnore,
   insertOne,
   now,
   updateMany,
@@ -69,38 +68,79 @@ export async function notify(userId, message, taskId = null, projectId = null, a
   });
 }
 
+let recurringJob = null;
+let recurringCoveredUntil = '';
+let recurringCheckedAt = 0;
+
+export function forgetRecurring() {
+  recurringCheckedAt = 0;
+  recurringCoveredUntil = '';
+}
+
 export async function ensureRecurring(weekStart, weekEnd) {
   const currentStart = isoDate(startOfWeek(new Date()));
   if (weekEnd < currentStart) return;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (Date.now() - recurringCheckedAt < 60_000 && recurringCoveredUntil >= weekEnd) return;
+    if (!recurringJob) {
+      const end = recurringCoveredUntil > weekEnd ? recurringCoveredUntil : weekEnd;
+      recurringJob = fillRecurring(currentStart, end).finally(() => {
+        recurringJob = null;
+      });
+    }
+    await recurringJob;
+  }
+}
+
+async function fillRecurring(currentStart, weekEnd) {
   const rules = await findMany('recurring_rules', { active: 1 });
+  const dates = [...eachDate(currentStart, weekEnd)];
+  if (!rules.length || !dates.length) {
+    recurringCoveredUntil = weekEnd;
+    recurringCheckedAt = Date.now();
+    return;
+  }
+  const existing = await findMany('tasks', {
+    recurring_rule_id: { $in: rules.map((rule) => rule.id) },
+    due_date: { $gte: dates[0], $lte: dates[dates.length - 1] },
+  });
+  const have = new Set(existing.map((task) => `${task.recurring_rule_id}:${task.due_date}`));
   const stamp = now();
-  for (const date of eachDate(weekStart, weekEnd)) {
-    if (date < currentStart) continue;
+  for (const date of dates) {
     const weekday = weekdayMon1(date);
     for (const rule of rules) {
       if (rule.cadence === 'daily' && weekday === 7) continue;
       if (rule.cadence === 'weekly' && weekday !== rule.weekday) continue;
-      await insertIgnore('tasks', {
-        id: id('task'),
-        title: rule.title,
-        description: rule.description || '',
-        project_id: rule.project_id || null,
-        stage_id: null,
-        creator_id: rule.assignee_id,
-        assignee_id: rule.assignee_id,
-        status: 'upcoming',
-        priority: rule.priority,
-        due_date: date,
-        kind: 'recurring',
-        recurring_rule_id: rule.id,
-        parent_task_id: null,
-        handoff_task_id: null,
-        created_at: stamp,
-        updated_at: stamp,
-        completed_at: null,
-      }, { recurring_rule_id: rule.id, due_date: date });
+      const key = `${rule.id}:${date}`;
+      if (have.has(key)) continue;
+      have.add(key);
+      try {
+        await insertOne('tasks', {
+          id: id('task'),
+          title: rule.title,
+          description: rule.description || '',
+          project_id: rule.project_id || null,
+          stage_id: null,
+          creator_id: rule.assignee_id,
+          assignee_id: rule.assignee_id,
+          status: 'upcoming',
+          priority: rule.priority,
+          due_date: date,
+          kind: 'recurring',
+          recurring_rule_id: rule.id,
+          parent_task_id: null,
+          handoff_task_id: null,
+          created_at: stamp,
+          updated_at: stamp,
+          completed_at: null,
+        });
+      } catch (error) {
+        if (error?.code !== 11000 && !String(error?.message || '').includes('UNIQUE')) throw error;
+      }
     }
   }
+  if (weekEnd > recurringCoveredUntil) recurringCoveredUntil = weekEnd;
+  recurringCheckedAt = Date.now();
 }
 
 export async function repairData() {
