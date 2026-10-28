@@ -29,7 +29,6 @@ import {
   notify,
   now,
   ping,
-  forgetRecurring,
   prepareWeek,
   repairData,
   updateMany,
@@ -171,27 +170,10 @@ async function shapeUser(row) {
   return shaped;
 }
 
-const authCache = new Map();
-const authFlight = new Map();
-const AUTH_TTL = 8_000;
-
 async function userContext(userId) {
-  const hit = authCache.get(userId);
-  if (hit && Date.now() - hit.at < AUTH_TTL) return hit.value;
-  const pending = authFlight.get(userId);
-  if (pending) return pending;
-  const loading = (async () => {
-    const row = await findOne('users', { _id: userId });
-    if (!row || !row.active) return null;
-    return shapeUser(row);
-  })().then((value) => {
-    if (value) authCache.set(userId, { at: Date.now(), value });
-    return value;
-  }).finally(() => {
-    authFlight.delete(userId);
-  });
-  authFlight.set(userId, loading);
-  return loading;
+  const row = await findOne('users', { _id: userId });
+  if (!row || !row.active) return null;
+  return shapeUser(row);
 }
 
 function requireAuth(req, res, next) {
@@ -1633,16 +1615,7 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
       if (!seesWholeTeam) assigneeIds = assigneeIds.filter((userId) => userId === req.auth.id);
       filter = { assignee_id: { $in: assigneeIds } };
     }
-    const afterWeek = isoDate(addDays(parseISODate(weekEnd), 1));
-    const horizon = isoDate(addDays(parseISODate(weekEnd), isCurrent ? 28 : 0));
-    const candidates = await findMany('tasks', {
-      ...filter,
-      $or: [
-        { due_date: { $gte: weekStart, $lte: horizon } },
-        { status: 'done', completed_at: { $gte: weekStart, $lt: afterWeek } },
-        { status: { $in: ['upcoming', 'in_progress', 'review'] }, due_date: { $lt: weekStart } },
-      ],
-    });
+    const candidates = await findMany('tasks', filter);
     let rows = candidates.filter((task) => matchesWeek(task, weekStart, weekEnd, isCurrent));
     if (isCurrent && scope === 'team') {
       // Later work is added per person, and only when that person has nothing due
@@ -2430,7 +2403,6 @@ app.post('/api/departures/:id/move', requireAuth, wrap(async (req, res) => {
       await updateOne('departure_requests', { _id: request.id }, { status: 'done' });
       return maybeFinishDeparture(person.id, req.auth);
     });
-    if (chosenRules.length) forgetRecurring();
     res.json({ ok: true, ...result });
   } catch (error) {
     if (error.status) return bad(res, error.status, error.message);
@@ -2492,7 +2464,6 @@ app.post('/api/recurring', requireAuth, wrap(async (req, res) => {
     active: 1,
     created_at: now(),
   });
-  forgetRecurring();
   await logActivity(req.auth.id, `${req.auth.name} set “${title.value}” to repeat.`, null, projectId);
   if (assigneeId !== req.auth.id) {
     await notify(assigneeId, `${req.auth.name} set a repeating task for you: “${title.value}”.`, null, projectId, 'repeating');
@@ -2540,7 +2511,6 @@ app.patch('/api/recurring/:id', requireAuth, wrap(async (req, res) => {
     project_id: projectId,
     active,
   });
-  forgetRecurring();
   if (assigneeId !== rule.assignee_id && assigneeId !== req.auth.id) {
     const next = await activeUser(assigneeId);
     if (next) {
@@ -2564,7 +2534,6 @@ app.delete('/api/recurring/:id', requireAuth, wrap(async (req, res) => {
   await updateMany('tasks', { recurring_rule_id: rule.id }, { recurring_rule_id: null });
   await deleteMany('departure_items', { rule_id: rule.id });
   await deleteOne('recurring_rules', { _id: rule.id });
-  forgetRecurring();
   await logActivity(req.auth.id, `${req.auth.name} stopped the repeat “${rule.title}”. Future weeks will not add it.`);
   res.json({ ok: true });
 }));

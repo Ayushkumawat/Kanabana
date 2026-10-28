@@ -173,24 +173,31 @@ async function insertEvent(meeting, attendees, sendUpdates) {
   }
   const meetUrl = meetUrlFrom(data);
   if (!/^https:\/\/meet\.google\.com\//.test(meetUrl)) {
+    if (data.id) await deleteGoogleEvent(data.id);
     throw fail('Google Calendar did not return a Meet link.');
   }
   return { meetUrl, eventId: data.id || '', invited: sendUpdates === 'all' };
 }
 
 export async function createGoogleMeet(meeting, attendees = []) {
+  if (!googleConnected()) return { meetUrl: '', eventId: '', invited: false };
   const people = attendees
     .filter((person) => person?.email)
     .map((person) => ({ email: person.email, optional: Boolean(person.optional) }));
-  if (people.length) {
-    try {
-      return await insertEvent(meeting, people, 'all');
-    } catch (error) {
-      if (error.message !== 'Google Meet could not be created.') throw error;
-      console.error('Google could not invite the attendees directly, so the office email will send the invitation.');
+  try {
+    if (people.length) {
+      try {
+        return await insertEvent(meeting, people, 'all');
+      } catch (error) {
+        if (error.message !== 'Google Meet could not be created.') throw error;
+        console.error('Google could not invite the attendees directly, so the office email will send the invitation.');
+      }
     }
+    return await insertEvent(meeting, [], 'none');
+  } catch (error) {
+    console.error(error.message);
+    return { meetUrl: '', eventId: '', invited: false };
   }
-  return insertEvent(meeting, [], 'none');
 }
 
 export async function deleteGoogleEvent(eventId) {

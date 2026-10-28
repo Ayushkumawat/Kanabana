@@ -10,13 +10,14 @@ const txContext = new AsyncLocalStorage();
 let client;
 let transactionMode;
 
-// One long-running Node process on a VM, office traffic (about 20 people).
-// A page open fires several requests at once, so keep a couple of connections warm
-// and allow a short burst. Idle connections drop after five minutes.
+// One long-running Node process on a VM, office traffic (about 20 people, short requests).
+// Pool stays small so an idle server does not hold Atlas connections (~1 MB each, plus
+// two monitoring connections per replica member). Raise maxPoolSize only if Atlas shows
+// operations waiting and the cluster CPU is not already busy.
 const CLIENT_OPTIONS = {
-  maxPoolSize: 20,
-  minPoolSize: 2,
-  maxIdleTimeMS: 300_000,
+  maxPoolSize: 10,
+  minPoolSize: 0,
+  maxIdleTimeMS: 60_000,
   serverSelectionTimeoutMS: 10_000,
   connectTimeoutMS: 10_000,
   socketTimeoutMS: 30_000,
@@ -93,8 +94,7 @@ function collection(name) {
 
 function sessionOpt() {
   const session = txContext.getStore();
-  if (!session || session.hasEnded) return {};
-  return { session };
+  return session ? { session } : {};
 }
 
 function shape(doc) {
@@ -201,30 +201,19 @@ async function supportsTransactions() {
   return transactionMode;
 }
 
-function expiredSession(error) {
-  return error?.name === 'MongoExpiredSessionError' || error?.codeName === 'ExpiredSession';
-}
-
 export async function withTx(fn) {
   if (txContext.getStore()) return fn();
   if (!(await supportsTransactions())) return fn();
-  let lastError;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const session = client.startSession();
-    try {
-      let result;
-      await session.withTransaction(() => txContext.run(session, async () => {
-        result = await fn();
-      }));
-      return result;
-    } catch (error) {
-      lastError = error;
-      if (!expiredSession(error) || attempt === 1) throw error;
-    } finally {
-      if (!session.hasEnded) await session.endSession().catch(() => {});
-    }
+  const session = client.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await txContext.run(session, () => fn());
+    });
+    return result;
+  } finally {
+    await session.endSession();
   }
-  throw lastError;
 }
 
 export async function ensureIndexes() {

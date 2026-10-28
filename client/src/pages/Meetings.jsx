@@ -87,8 +87,8 @@ export default function Meetings() {
       {error ? <p className="banner">{error}</p> : null}
       {!googleReady ? (
         <p className="banner">
-          Google Calendar isn’t connected, so a meeting email can’t include a Meet link yet.
-          {user.isAdmin ? <> <button type="button" className="btn small" onClick={connectGoogle}>Connect Google Calendar</button></> : ' Ask an admin to connect it.'}
+          Google Calendar isn’t connected. You can still schedule, and the invitation goes out by email without a Meet link.
+          {user.isAdmin ? <> <button type="button" className="btn small" onClick={connectGoogle}>Connect Google Calendar</button></> : ' An admin can connect it so later meetings include a Meet link.'}
         </p>
       ) : null}
       <form className="panel stack" onSubmit={submit}>

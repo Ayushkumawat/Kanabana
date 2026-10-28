@@ -691,6 +691,27 @@ export function registerSections(app, ctx) {
     res.json({ ok: true });
   }));
 
+  app.post('/api/hiring/resumes/:id/bucket', requireAuth, wrap(async (req, res) => {
+    if (!hiringGate(req, res)) return undefined;
+    const bucket = req.body.bucket;
+    if (!['pending', 'selected', 'rejected'].includes(bucket)) return bad(res, 400, 'Choose review pending, selected, or not selected');
+    const row = await findOne('hiring_resumes', { _id: req.params.id });
+    if (!row) return bad(res, 404, 'Resume not found');
+    if (row.reviewer_id !== req.auth.id) return bad(res, 403, 'The reviewer moves this resume');
+    const current = row.status === 'new' || row.status === 'in_review'
+      ? 'pending'
+      : (row.status === 'passed' || row.status === 'discarded' ? 'rejected' : 'selected');
+    if (current !== bucket) {
+      const status = bucket === 'pending' ? 'in_review' : bucket === 'selected' ? 'shortlisted' : 'passed';
+      await updateOne('hiring_resumes', { _id: row.id }, { status });
+      if (row.uploaded_by !== req.auth.id) {
+        const label = bucket === 'pending' ? 'review pending' : bucket === 'selected' ? 'selected' : 'not selected';
+        await notify(row.uploaded_by, `${req.auth.name} moved ${row.candidate_name} to ${label}.`, null, null, 'hiring');
+      }
+    }
+    res.json({ ok: true });
+  }));
+
   app.post('/api/hiring/resumes/:id/reviewer', requireAuth, wrap(async (req, res) => {
     if (!hiringGate(req, res)) return undefined;
     const row = await findOne('hiring_resumes', { _id: req.params.id });
@@ -720,38 +741,6 @@ export function registerSections(app, ctx) {
     }
     await deleteOne('hiring_resumes', { _id: row.id });
     await logActivity(req.auth.id, `${req.auth.name} removed ${row.candidate_name}’s resume.`);
-    res.json({ ok: true });
-  }));
-
-  function hiringBucket(status) {
-    if (status === 'new' || status === 'in_review') return 'pending';
-    if (status === 'passed' || status === 'discarded') return 'rejected';
-    return 'selected';
-  }
-
-  app.post('/api/hiring/resumes/:id/decision', requireAuth, wrap(async (req, res) => {
-    if (!hiringGate(req, res)) return undefined;
-    const row = await findOne('hiring_resumes', { _id: req.params.id });
-    if (!row) return bad(res, 404, 'Resume not found');
-    if (row.reviewer_id !== req.auth.id && !req.auth.isAdmin && !isHr(req.auth)) {
-      return bad(res, 403, 'The reviewer moves this resume');
-    }
-    const decision = req.body.decision;
-    if (!['pending', 'selected', 'rejected'].includes(decision)) return bad(res, 400, 'Choose selected, not selected, or review pending');
-    if (hiringBucket(row.status) === decision) return res.json({ ok: true });
-    const position = await findOne('hiring_positions', { _id: row.position_id });
-    const role = position?.title || 'the role';
-    if (decision === 'pending') {
-      await updateOne('hiring_resumes', { _id: row.id }, { status: 'in_review' });
-    } else if (decision === 'selected') {
-      await updateOne('hiring_resumes', { _id: row.id }, { status: 'shortlisted' });
-      if (row.uploaded_by !== req.auth.id) {
-        await notify(row.uploaded_by, `${row.candidate_name} is selected for interview for ${role}. Add the meet link, date, and time.`, null, null, 'hiring');
-      }
-    } else {
-      await updateOne('hiring_resumes', { _id: row.id }, { status: 'passed' });
-    }
-    await logActivity(req.auth.id, `${req.auth.name} marked ${row.candidate_name} as ${decision === 'pending' ? 'review pending' : decision === 'selected' ? 'selected' : 'not selected'} for ${role}.`);
     res.json({ ok: true });
   }));
 
@@ -1147,12 +1136,7 @@ export function registerSections(app, ctx) {
       attendee_ids: userIds,
       created_at: now(),
     };
-    let meet;
-    try {
-      meet = await createGoogleMeet(meeting, people);
-    } catch (error) {
-      return bad(res, error.status || 502, error.message);
-    }
+    const meet = await createGoogleMeet(meeting, people);
     meeting.meet_url = meet.meetUrl;
     meeting.google_event_id = meet.eventId;
     await insertOne('meetings', meeting);
@@ -1165,6 +1149,10 @@ export function registerSections(app, ctx) {
         return bad(res, 502, 'The invitation email could not be sent. Check the mail settings and try again.');
       }
       warning = result.failed.length ? `Saved, but the invitation did not reach ${result.failed.join(', ')}.` : '';
+    }
+    if (!meet.meetUrl) {
+      const note = 'There is no Google Meet link until an admin connects Google Calendar.';
+      warning = warning ? `${warning} ${note}` : `Invitations sent by email. ${note}`;
     }
     await logActivity(req.auth.id, `${req.auth.name} scheduled “${title.value}”.`);
     for (const person of people) {

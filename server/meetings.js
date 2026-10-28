@@ -110,17 +110,12 @@ export async function sendInvites(meeting, attendees) {
     const meetUrl = meeting.meet_url || '';
     const text = [
       `${meeting.organizer_name} scheduled “${meeting.title}”.`,
-      '',
-      `Google Meet: ${meetUrl}`,
-      '',
+      meetUrl ? `Google Meet: ${meetUrl}` : '',
       when,
-      '',
       meeting.agenda,
-      '',
       `With ${names}.`,
-      '',
       'Accept the calendar invitation in this email to add it to your calendar.',
-    ].join('\n');
+    ].filter(Boolean).join('\n\n');
     const ok = await sendMail({
       to: person.email,
       subject: `Meeting: ${meeting.title}`,

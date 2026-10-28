@@ -84,8 +84,7 @@ export default function Hiring() {
       </div>
       {data.storageReady === false ? <p className="banner">This server cannot store resumes yet. Add the AWS storage keys on the hosted machine and restart it.</p> : null}
       {error ? <p className="banner">{error}</p> : null}
-      {user.isHr ? <>
-      <form className="panel stack" onSubmit={(event) => {
+      {data.isHr ? <form className="panel stack" onSubmit={(event) => {
         event.preventDefault();
         run(() => api('/hiring/positions', { method: 'POST', body: position }).then(() => setPosition({ title: '', description: '', departmentId: position.departmentId })), 'Position opened');
       }}>
@@ -100,8 +99,8 @@ export default function Hiring() {
         </div>
         <Field label="Description"><textarea value={position.description} onChange={(event) => setPosition({ ...position, description: event.target.value })} /></Field>
         <div className="form-actions"><button className="btn primary" disabled={busy}>Add position</button></div>
-      </form>
-      <form className="panel stack" onSubmit={(event) => {
+      </form> : null}
+      {data.isHr ? <form className="panel stack" onSubmit={(event) => {
         event.preventDefault();
         if (resume.referral && !resume.referralName.trim()) {
           setError('Write the referrer’s name');
@@ -140,8 +139,7 @@ export default function Hiring() {
         ) : null}
         <FilePick label="Resume file" required onFile={(file) => setResume({ ...resume, file })} />
         <div className="form-actions"><button className="btn primary" disabled={busy}>Add resume</button></div>
-      </form>
-      </> : null}
+      </form> : null}
       {data.positions.map((item) => {
         const resumes = data.resumes.filter((row) => row.positionId === item.id);
         const pendingCount = resumes.filter((row) => resumeBucket(row.status) === 'pending').length;
@@ -381,8 +379,6 @@ function ResumeMenu({ row, people, busy, onReplace, onReviewer, onDelete }) {
 function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSchedule, account, onAccount, departments, run, toast }) {
   const canSchedule = ['shortlisted', 'next_round'].includes(row.status) && (row.uploadedBy === user.id || data.isAdmin || data.isHr);
   const canOutcome = row.status === 'scheduled' && (row.reviewerId === user.id || row.uploadedBy === user.id || data.isAdmin || data.isHr);
-  const canDecide = row.reviewerId === user.id || data.isAdmin || data.isHr;
-  const bucket = resumeBucket(row.status);
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState('');
 
@@ -445,20 +441,22 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
       <div className="row-actions">
         <button type="button" className="btn small" onClick={openPreview}>View resume</button>
       </div>
-      {row.fileAvailable === false ? <p className="error">The resume file is missing.</p> : null}
-      {canDecide ? (
-        <div className="row-actions">
-          {bucket !== 'selected' ? (
-            <button type="button" className="btn small" disabled={busy} onClick={() => run(() => api(`/hiring/resumes/${row.id}/decision`, { method: 'POST', body: { decision: 'selected' } }), 'Marked selected')}>Selected</button>
-          ) : null}
-          {bucket !== 'rejected' ? (
-            <button type="button" className="btn ghost small" disabled={busy} onClick={() => run(() => api(`/hiring/resumes/${row.id}/decision`, { method: 'POST', body: { decision: 'rejected' } }), 'Marked not selected')}>Not selected</button>
-          ) : null}
-          {bucket !== 'pending' ? (
-            <button type="button" className="btn small" disabled={busy} onClick={() => run(() => api(`/hiring/resumes/${row.id}/decision`, { method: 'POST', body: { decision: 'pending' } }), 'Moved back to review')}>Review pending</button>
-          ) : null}
+      {row.reviewerId === user.id ? (
+        <div className="segment" role="group" aria-label={`Move ${row.candidateName}`}>
+          {FILTERS.map((entry) => (
+            <button
+              type="button"
+              key={entry.id}
+              className={resumeBucket(row.status) === entry.id ? 'on' : ''}
+              disabled={busy || resumeBucket(row.status) === entry.id}
+              onClick={() => run(() => api(`/hiring/resumes/${row.id}/bucket`, { method: 'POST', body: { bucket: entry.id } }), 'Status updated')}
+            >
+              {entry.label}
+            </button>
+          ))}
         </div>
       ) : null}
+      {row.fileAvailable === false ? <p className="error">The resume file is missing.</p> : null}
       {preview || previewError ? (
         <Modal title={row.candidateName} className="resume" onClose={closePreview}>
           <div className="resume-bar">

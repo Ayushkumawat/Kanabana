@@ -99,17 +99,13 @@ export default function Layout() {
   const [passwordError, setPasswordError] = useState('');
   const [busy, setBusy] = useState(false);
   const panel = useRef(null);
-  const pathRef = useRef(location.pathname);
-  const notesRef = useRef(notes);
-  pathRef.current = location.pathname;
-  notesRef.current = notes;
 
   useEffect(() => {
     let stop = false;
     async function load() {
       try {
         const data = await api('/notifications');
-        const area = areaFor(pathRef.current);
+        const area = areaFor(location.pathname);
         if (area && data.areas?.[area]) {
           await api('/notifications/seen', { method: 'POST', body: { area } });
           data.areas[area] = 0;
@@ -125,23 +121,7 @@ export default function Layout() {
       stop = true;
       clearInterval(timer);
     };
-  }, [user.id, noteTick]);
-
-  useEffect(() => {
-    const area = areaFor(location.pathname);
-    if (!area || !notesRef.current.areas?.[area]) return undefined;
-    let stop = false;
-    api('/notifications/seen', { method: 'POST', body: { area } })
-      .then(() => {
-        if (!stop) {
-          setNotes((current) => ({ ...current, areas: { ...current.areas, [area]: 0 } }));
-        }
-      })
-      .catch(() => {});
-    return () => {
-      stop = true;
-    };
-  }, [location.pathname, user.id]);
+  }, [user.id, location.pathname, noteTick]);
 
   useEffect(() => {
     const bump = () => setNoteTick((value) => value + 1);
