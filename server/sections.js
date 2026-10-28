@@ -738,10 +738,18 @@ export function registerSections(app, ctx) {
     if (!hiringGate(req, res)) return undefined;
     const position = await findOne('hiring_positions', { _id: req.params.id });
     if (!position) return bad(res, 404, 'Position not found');
+    const chosen = new Set(Array.isArray(req.body.resumeIds) ? req.body.resumeIds : []);
+    const chosenRows = (await findMany('hiring_resumes', { position_id: position.id })).filter((row) => chosen.has(row.id));
+    if (chosenRows.length && chosenRows.every((row) => row.status === 'passed' || row.status === 'discarded')) {
+      for (const row of chosenRows) {
+        await updateOne('hiring_resumes', { _id: row.id }, { status: 'shortlisted' });
+        await notify(row.uploaded_by, `${row.candidate_name} is selected for interview for ${position.title}. Add the meet link, date, and time.`, null, null, 'hiring');
+      }
+      return res.json({ ok: true });
+    }
     const mine = await findMany('hiring_resumes', { position_id: position.id, status: 'in_review', reviewer_id: req.auth.id });
     if (!mine.length && !req.auth.isAdmin) return bad(res, 403, 'These resumes are not waiting on you');
     const pool = mine.length ? mine : await findMany('hiring_resumes', { position_id: position.id, status: 'in_review' });
-    const chosen = new Set(Array.isArray(req.body.resumeIds) ? req.body.resumeIds : []);
     if (![...chosen].some((resumeId) => pool.some((row) => row.id === resumeId))) {
       return bad(res, 400, 'Select at least one resume');
     }

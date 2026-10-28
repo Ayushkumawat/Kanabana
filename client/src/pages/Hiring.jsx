@@ -7,6 +7,18 @@ import Modal from '../components/Modal';
 import { downloadFile, previewFileUrl, readFile } from '../files';
 import { formatDay } from '../util';
 
+const FILTERS = [
+  { id: 'pending', label: 'Review pending' },
+  { id: 'selected', label: 'Selected' },
+  { id: 'rejected', label: 'Not selected' },
+];
+
+function resumeBucket(status) {
+  if (status === 'new' || status === 'in_review') return 'pending';
+  if (status === 'passed' || status === 'discarded') return 'rejected';
+  return 'selected';
+}
+
 const STATUS_LABEL = {
   new: 'New',
   in_review: 'In review',
@@ -28,6 +40,7 @@ export default function Hiring() {
   const [resume, setResume] = useState({ positionId: '', candidateName: '', comment: '', referral: false, referralName: '', file: null });
   const [reviewer, setReviewer] = useState({});
   const [picked, setPicked] = useState({});
+  const [resumeView, setResumeView] = useState({});
   const [schedule, setSchedule] = useState({});
   const [account, setAccount] = useState({});
   const [error, setError] = useState('');
@@ -129,8 +142,11 @@ export default function Hiring() {
       </form>
       {data.positions.map((item) => {
         const resumes = data.resumes.filter((row) => row.positionId === item.id);
-        const mine = resumes.filter((row) => row.status === 'in_review' && (row.reviewerId === user.id || data.isAdmin));
+        const pendingCount = resumes.filter((row) => resumeBucket(row.status) === 'pending').length;
+        const filter = resumeView[item.id] || (pendingCount ? 'pending' : 'selected');
+        const shown = resumes.filter((row) => resumeBucket(row.status) === filter);
         const selected = picked[item.id] || [];
+        const pickedHere = selected.filter((id) => shown.some((row) => row.id === id));
         return (
           <section key={item.id} className="panel stack">
             <div className="row-between">
@@ -153,8 +169,22 @@ export default function Hiring() {
               </form>
             ) : null}
             {resumes.length === 0 ? <p className="muted">No resumes yet.</p> : (
+            <>
+            <div className="segment">
+              {FILTERS.map((entry) => (
+                <button
+                  type="button"
+                  key={entry.id}
+                  className={filter === entry.id ? 'on' : ''}
+                  onClick={() => setResumeView({ ...resumeView, [item.id]: entry.id })}
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+            {shown.length === 0 ? <p className="muted">Nothing in {FILTERS.find((entry) => entry.id === filter).label.toLowerCase()}.</p> : (
             <div className="hire-grid">
-            {resumes.map((row) => (
+            {shown.map((row) => (
               <ResumeCard
                 key={row.id}
                 row={row}
@@ -177,16 +207,18 @@ export default function Hiring() {
             ))}
             </div>
             )}
-            {mine.length ? (
+            {((filter === 'rejected') || (filter === 'pending' && shown.some((row) => row.status === 'in_review' && pickedHere.includes(row.id)))) && pickedHere.length ? (
               <button
                 type="button"
                 className="btn primary"
                 disabled={busy}
-                onClick={() => run(() => api(`/hiring/positions/${item.id}/submit`, { method: 'POST', body: { resumeIds: selected } }), 'Selection sent')}
+                onClick={() => run(() => api(`/hiring/positions/${item.id}/submit`, { method: 'POST', body: { resumeIds: pickedHere } }), 'Selection sent')}
               >
                 Submit selected resumes
               </button>
             ) : null}
+            </>
+            )}
           </section>
         );
       })}
@@ -435,6 +467,12 @@ function ResumeCard({ row, user, data, busy, selected, onToggle, schedule, onSch
         <label className="check">
           <input type="checkbox" checked={selected} onChange={onToggle} />
           Select for interview
+        </label>
+      ) : null}
+      {(row.status === 'passed' || row.status === 'discarded') ? (
+        <label className="check">
+          <input type="checkbox" checked={selected} onChange={onToggle} />
+          Select
         </label>
       ) : null}
       {canSchedule ? (
