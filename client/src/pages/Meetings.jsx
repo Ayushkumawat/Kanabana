@@ -83,12 +83,17 @@ export default function Meetings() {
           <h1>Meetings</h1>
           <p className="lede">Pick the people, the day, and the time, and write the agenda. Each person gets a calendar invitation by email, with the Google Meet link in the message. Accepting it adds the meeting to their calendar.</p>
         </div>
+        {user.isAdmin ? (
+          <button type="button" className="btn" onClick={connectGoogle}>
+            {googleReady ? 'Reconnect Google Calendar' : 'Connect Google Calendar'}
+          </button>
+        ) : null}
       </div>
       {error ? <p className="banner">{error}</p> : null}
       {!googleReady ? (
         <p className="banner">
           Google Calendar isn’t connected. You can still schedule, and the invitation goes out by email without a Meet link.
-          {user.isAdmin ? <> <button type="button" className="btn small" onClick={connectGoogle}>Connect Google Calendar</button></> : ' An admin can connect it so later meetings include a Meet link.'}
+          {user.isAdmin ? '' : ' An admin can connect it so later meetings include a Meet link.'}
         </p>
       ) : null}
       <form className="panel stack" onSubmit={submit}>

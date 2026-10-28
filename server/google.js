@@ -17,6 +17,16 @@ function readTokenFile() {
   }
 }
 
+function writeEnv(key, value) {
+  const envPath = path.resolve(path.dirname(tokenPath), '../../.env');
+  if (!fs.existsSync(envPath)) return;
+  const line = `${key}=${JSON.stringify(value)}`;
+  let env = fs.readFileSync(envPath, 'utf8');
+  if (new RegExp(`^${key}=`, 'm').test(env)) env = env.replace(new RegExp(`^${key}=.*$`, 'm'), line);
+  else env += (env.endsWith('\n') ? '' : '\n') + `${line}\n`;
+  fs.writeFileSync(envPath, env);
+}
+
 function fail(message) {
   const error = new Error(message);
   error.status = 502;
@@ -102,6 +112,7 @@ export async function finishGoogleAuth(code, state) {
   }
   fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
   fs.writeFileSync(tokenPath, JSON.stringify({ clientId, clientSecret, refreshToken: data.refresh_token }));
+  writeEnv('GOOGLE_REFRESH_TOKEN', data.refresh_token);
   process.env.GOOGLE_REFRESH_TOKEN = data.refresh_token;
   cached = null;
   readyUntil = 0;

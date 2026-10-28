@@ -2,6 +2,27 @@ import { addDays, isoDate, parseISODate, todayISO } from './dates.js';
 import { findMany, findOne, notify, updateOne, usersByIds } from './db.js';
 import { sendOverdueEmail } from './mail.js';
 
+const OFFICE = 'Asia/Kolkata';
+
+function officeClock(date = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: OFFICE,
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+  let hour = Number(parts.hour);
+  if (hour === 24) hour = 0;
+  return { weekday: parts.weekday, hour, minute: Number(parts.minute) };
+}
+
+// Deadline emails copy the team lead. They go out once, on Monday morning.
+export function isMondayMorning(date = new Date()) {
+  const clock = officeClock(date);
+  return clock.weekday === 'Mon' && clock.hour >= 8 && clock.hour < 12;
+}
+
 async function leadsFor(userId) {
   const links = await findMany('user_departments', { user_id: userId });
   if (!links.length) return [];
@@ -18,6 +39,7 @@ async function leadsFor(userId) {
 }
 
 export async function scanOverdue() {
+  if (!isMondayMorning()) return;
   const today = todayISO();
   const oldest = isoDate(addDays(parseISODate(today), -7));
   const open = await findMany('tasks', { status: { $ne: 'done' }, due_date: { $gte: oldest, $lt: today } });
