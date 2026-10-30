@@ -1617,35 +1617,14 @@ app.get('/api/tasks', requireAuth, wrap(async (req, res) => {
     }
     const candidates = await findMany('tasks', filter);
     let rows = candidates.filter((task) => matchesWeek(task, weekStart, weekEnd, isCurrent));
-    if (isCurrent && scope === 'team') {
-      // Later work is added per person, and only when that person has nothing due
-      // this week. A shared "no To do cards" check made one move hide other people.
-      const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
+    if (isCurrent) {
+      // Every later To do card stays on this week's To do column. Inclusion does not
+      // depend on other cards, so moving one task cannot hide someone else's.
       const seen = new Set(rows.map((row) => row.id));
-      const byAssignee = new Map();
-      for (const task of candidates) {
-        if (!byAssignee.has(task.assignee_id)) byAssignee.set(task.assignee_id, []);
-        byAssignee.get(task.assignee_id).push(task);
-      }
-      for (const tasks of byAssignee.values()) {
-        const hasThisWeek = tasks.some((task) => task.due_date >= weekStart && task.due_date <= weekEnd);
-        if (hasThisWeek) continue;
-        const extra = tasks
-          .filter((task) => !seen.has(task.id) && task.status !== 'done' && task.due_date > weekEnd && task.due_date <= horizon)
-          .map((task) => ({ ...task, from_next: 1 }));
-        for (const task of extra) seen.add(task.id);
-        rows = rows.concat(extra);
-      }
-    } else if (isCurrent) {
-      const hasTodo = rows.some((row) => row.status === 'upcoming' && row.due_date >= weekStart && row.due_date <= weekEnd);
-      if (!hasTodo) {
-        const horizon = isoDate(addDays(parseISODate(weekEnd), 28));
-        const seen = new Set(rows.map((row) => row.id));
-        const extra = candidates
-          .filter((task) => !seen.has(task.id) && task.status !== 'done' && task.due_date > weekEnd && task.due_date <= horizon)
-          .map((task) => ({ ...task, from_next: 1 }));
-        rows = rows.concat(extra);
-      }
+      const extra = candidates
+        .filter((task) => !seen.has(task.id) && task.status === 'upcoming' && task.due_date > weekEnd)
+        .map((task) => ({ ...task, from_next: 1 }));
+      rows = rows.concat(extra);
     }
     rows.sort(byDue);
     rows = await omitPrivateTasks(req.auth, rows);
