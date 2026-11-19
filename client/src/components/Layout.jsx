@@ -26,7 +26,7 @@ const GROUPS = [
       { to: '/requests', label: 'Requests', area: 'requests' },
       { to: '/chores', label: 'Chores', area: 'chores' },
       { to: '/knowledge', label: 'Knowledge', area: 'knowledge' },
-      { to: '/dependencies', label: 'Help', area: 'dependencies' },
+      { to: '/dependencies', label: 'Dependencies', area: 'dependencies' },
       { to: '/tenders', label: 'Tenders', area: 'tenders', gate: 'office' },
       { to: '/hiring', label: 'Hiring', area: 'hiring', gate: 'hiring' },
     ],
