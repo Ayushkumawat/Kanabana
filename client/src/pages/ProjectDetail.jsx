@@ -49,10 +49,11 @@ export default function ProjectDetail() {
   if (!project) return <p className="muted">Loading project…</p>;
 
   const today = parseISODate(todayISO()).getTime();
-  const departmentIds = new Set(project.departments.map((item) => item.id));
+  const visibleMembers = project.members.filter((member) => !member.implicit);
   const memberOptions = people.filter((person) => (
-    !project.members.some((member) => member.id === person.id)
-    && person.departments.some((item) => departmentIds.has(item.id))
+    !person.isLead
+    && !person.isManager
+    && !project.members.some((member) => member.id === person.id)
   ));
   const work = [...tasks].sort((a, b) => a.dueDate.localeCompare(b.dueDate) || a.title.localeCompare(b.title));
 
@@ -184,7 +185,7 @@ export default function ProjectDetail() {
         <div className="stack">
           <section className="panel stack">
             <h2>People</h2>
-            {project.members.map((member) => (
+            {visibleMembers.map((member) => (
               <div key={member.id} className="row-between">
                 <span>{member.name}</span>
                 {project.canAssign ? (
@@ -219,7 +220,7 @@ export default function ProjectDetail() {
                   }
                 }}
               >
-                <Field label="Add someone from these teams">
+                <Field label="Add someone" hint="Team leads and managers are already on this project. Anyone else in the company can be added.">
                   <select value={memberId} onChange={(event) => setMemberId(event.target.value)} required>
                     <option value="">Choose</option>
                     {memberOptions.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}

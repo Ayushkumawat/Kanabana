@@ -63,9 +63,10 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
     .filter((person) => listedPerson(person, user, people, wide));
   const fromTeams = project && canAssign
     ? people.filter((person) => person.active !== false
+      && !person.isLead
+      && !person.isManager
       && listedPerson(person, user, people, wide)
-      && !project.members.some((member) => member.id === person.id)
-      && (wide || person.departments?.some((item) => project.departments.some((team) => team.id === item.id))))
+      && !project.members.some((member) => member.id === person.id))
     : [];
   const adding = fromTeams.some((person) => assigneeIds.includes(person.id));
   const several = assigneeIds.length > 1;
@@ -162,7 +163,7 @@ export default function TaskForm({ projects, people, fixedProjectId = '', defaul
             onChange={setAssigneeIds}
             groups={project ? [
               { label: 'On this project', people: onProject },
-              ...(fromTeams.length ? [{ label: wide ? 'Anyone else' : 'Add from these teams', people: fromTeams }] : []),
+              ...(fromTeams.length ? [{ label: 'Anyone else', people: fromTeams }] : []),
             ] : [{ people: onProject }]}
           />
         </Field>

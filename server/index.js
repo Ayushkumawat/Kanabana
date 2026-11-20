@@ -205,8 +205,27 @@ async function activeUser(userId) {
   return user;
 }
 
-function isProjectMember(projectId, userId) {
-  return exists('project_members', { project_id: projectId, user_id: userId });
+async function standingUserIds() {
+  const [managers, departments] = await Promise.all([
+    findMany('users', { manager: 1, active: 1 }),
+    findMany('departments', { lead_id: { $ne: null } }),
+  ]);
+  const leadIds = [...new Set(departments.map((department) => department.lead_id).filter(Boolean))];
+  const leads = leadIds.length ? await findMany('users', { _id: { $in: leadIds }, active: 1 }) : [];
+  return new Set([...managers, ...leads].map((user) => user.id));
+}
+
+async function isStandingUser(userId) {
+  if (!userId) return false;
+  const user = await findOne('users', { _id: userId });
+  if (!user?.active) return false;
+  if (user.manager) return true;
+  return exists('departments', { lead_id: userId });
+}
+
+async function isProjectMember(projectId, userId) {
+  if (await exists('project_members', { project_id: projectId, user_id: userId })) return true;
+  return isStandingUser(userId);
 }
 
 const NOT_ON_PROJECT = 'You’re not part of this project. Ask the team lead to add you.';
@@ -234,16 +253,11 @@ async function omitPrivateTasks(auth, tasks) {
 }
 
 async function canViewProject(auth, projectId) {
-  if (auth.isAdmin || auth.isManager || await isProjectMember(projectId, auth.id)) return true;
+  if (auth.isAdmin || auth.isManager || auth.isLead || await isProjectMember(projectId, auth.id)) return true;
   const project = await findOne('projects', { _id: projectId });
   if (project?.created_by === auth.id) return true;
   const projectDepartments = await findMany('project_departments', { project_id: projectId });
   return projectDepartments.some((link) => auth.leadDepartmentIds.includes(link.department_id));
-}
-
-async function userInDepartments(userId, departmentIds) {
-  if (!departmentIds.length) return false;
-  return exists('user_departments', { user_id: userId, department_id: { $in: departmentIds } });
 }
 
 async function assigneeInLeadDepts(auth, assigneeId) {
@@ -269,7 +283,7 @@ async function canDeleteProject(auth, row) {
 
 async function canAssignOnProject(auth, project) {
   if (!project) return false;
-  if (auth.isAdmin || auth.isManager || project.created_by === auth.id) return true;
+  if (auth.isAdmin || auth.isManager || auth.isLead || project.created_by === auth.id) return true;
   const ids = await projectDepartmentIds(project.id);
   return ids.some((departmentId) => auth.leadDepartmentIds.includes(departmentId));
 }
@@ -367,9 +381,11 @@ async function presentProjects(rows, auth, withHistory = false) {
     findMany('project_timelines', { project_id: { $in: ids } }),
   ]);
   const deptMap = new Map(departments.map((department) => [department.id, department]));
+  const standingIds = await standingUserIds();
   const userIds = new Set(rows.map((row) => row.created_by));
   for (const link of memberLinks) userIds.add(link.user_id);
   for (const item of history) userIds.add(item.actor_id);
+  for (const standingId of standingIds) userIds.add(standingId);
   const users = await usersByIds([...userIds]);
   const privateAssignees = seesConfidential(auth) ? new Set() : await managerIdSet();
   const linksByProject = groupBy(deptLinks, 'project_id');
@@ -383,14 +399,22 @@ async function presentProjects(rows, auth, withHistory = false) {
       .filter(Boolean)
       .sort(byName)
       .map((department) => ({ id: department.id, name: department.name }));
-    const members = (membersByProject.get(row.id) || [])
+    const explicit = (membersByProject.get(row.id) || [])
       .map((link) => users.get(link.user_id))
-      .filter(Boolean)
+      .filter((member) => member && !standingIds.has(member.id));
+    const implicit = [...standingIds].map((userId) => users.get(userId)).filter(Boolean);
+    const members = [...explicit, ...implicit]
       .sort(byName)
-      .map((member) => ({ id: member.id, name: member.name, active: Boolean(member.active) }));
+      .map((member) => ({
+        id: member.id,
+        name: member.name,
+        active: Boolean(member.active),
+        implicit: standingIds.has(member.id),
+      }));
     const projectTasks = (tasksByProject.get(row.id) || []).filter((task) => !privateAssignees.has(task.assignee_id));
     const onTeam = projectDepartments.some((item) => auth.leadDepartmentIds.includes(item.id));
     const wide = auth.isAdmin || auth.isManager;
+    const included = wide || auth.isLead;
     const savedTimelines = timelinesByProject.get(row.id) || [];
     const teamTimelines = projectDepartments.map((department) => {
       const saved = savedTimelines.find((item) => item.department_id === department.id);
@@ -435,10 +459,10 @@ async function presentProjects(rows, auth, withHistory = false) {
       createdByName: users.get(row.created_by)?.name || '',
       canManage: auth.isAdmin || row.created_by === auth.id,
       canDelete: auth.isAdmin || row.created_by === auth.id || onTeam,
-      canAssign: wide || row.created_by === auth.id || onTeam,
+      canAssign: wide || auth.isLead || row.created_by === auth.id || onTeam,
       canEditTimeline: auth.isAdmin || onTeam,
-      canOpen: wide || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
-      canAddTask: wide || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
+      canOpen: included || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
+      canAddTask: included || row.created_by === auth.id || onTeam || members.some((member) => member.id === auth.id),
     };
     if (!withHistory) return project;
     const items = (historyByProject.get(row.id) || []).map((item) => ({
@@ -1353,15 +1377,14 @@ app.post('/api/projects', requireAuth, wrap(async (req, res) => {
   const departmentIds = uniqueList(req.body.departmentIds);
   const memberIds = uniqueList(req.body.memberIds);
   if (!departmentIds.length) return bad(res, 400, 'Choose at least one department');
-  if (!memberIds.length) return bad(res, 400, 'Add at least one person');
+  const standing = await standingUserIds();
+  const chosenIds = memberIds.filter((memberId) => !standing.has(memberId));
+  if (!chosenIds.length) return bad(res, 400, 'Add at least one person');
   const foundDepartments = await findMany('departments', { _id: { $in: departmentIds } });
   if (foundDepartments.length !== departmentIds.length) return bad(res, 400, 'Choose a real department');
-  for (const memberId of memberIds) {
+  for (const memberId of chosenIds) {
     const member = await activeUser(memberId);
     if (!member) return bad(res, 400, 'Add active people only');
-    if (!await userInDepartments(memberId, departmentIds)) {
-      return bad(res, 400, `${member.name} is not in the selected departments`);
-    }
   }
   const projectId = id('prj');
   await withTx(async () => {
@@ -1378,7 +1401,7 @@ app.post('/api/projects', requireAuth, wrap(async (req, res) => {
     for (const departmentId of departmentIds) {
       await insertOne('project_departments', { _id: `${projectId}:${departmentId}`, project_id: projectId, department_id: departmentId });
     }
-    for (const memberId of memberIds) {
+    for (const memberId of chosenIds) {
       await insertOne('project_members', { _id: `${projectId}:${memberId}`, project_id: projectId, user_id: memberId });
     }
     for (const department of foundDepartments) {
@@ -1521,11 +1544,8 @@ app.post('/api/projects/:id/members', requireAuth, wrap(async (req, res) => {
   if (!await canAssignOnProject(req.auth, row)) return bad(res, 403, 'A team lead on this project can add people');
   const member = await activeUser(req.body.userId);
   if (!member) return bad(res, 400, 'Choose an active person');
+  if (await isStandingUser(member.id)) return bad(res, 400, 'Team leads and managers are already on every project');
   if (await isProjectMember(row.id, member.id)) return bad(res, 400, 'They are already on this project');
-  const departmentIds = await projectDepartmentIds(row.id);
-  if (!req.auth.isAdmin && !req.auth.isManager && !await userInDepartments(member.id, departmentIds)) {
-    return bad(res, 400, `${member.name} is not in this project’s departments`);
-  }
   await insertOne('project_members', { _id: `${row.id}:${member.id}`, project_id: row.id, user_id: member.id });
   await logActivity(req.auth.id, `${req.auth.name} added ${member.name} to ${row.name}.`, null, row.id);
   await notify(member.id, `${req.auth.name} added you to ${row.name}.`, null, row.id);
@@ -1536,6 +1556,7 @@ app.delete('/api/projects/:id/members/:userId', requireAuth, wrap(async (req, re
   const row = await findOne('projects', { _id: req.params.id });
   if (!row) return bad(res, 404, 'Project not found');
   if (!await canAssignOnProject(req.auth, row)) return bad(res, 403, 'A team lead on this project can remove people');
+  if (await isStandingUser(req.params.userId)) return bad(res, 400, 'Team leads and managers stay on every project');
   const open = await count('tasks', { project_id: row.id, assignee_id: req.params.userId, status: { $ne: 'done' } });
   if (open) return bad(res, 400, 'They still have open work on this project');
   await deleteOne('project_members', { project_id: row.id, user_id: req.params.userId });

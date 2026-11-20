@@ -44,8 +44,8 @@ export default function Projects() {
   }, [user.isAdmin, user.isLead, user.isManager]);
 
   const memberChoices = useMemo(
-    () => people.filter((person) => person.departments.some((item) => form.departmentIds.includes(item.id))),
-    [people, form.departmentIds],
+    () => people.filter((person) => !person.isLead && !person.isManager),
+    [people],
   );
 
   function toggle(list, id) {
@@ -76,7 +76,7 @@ export default function Projects() {
       <div className="page-head">
         <div>
           <h1>Projects</h1>
-          <p className="lede">{user.isAdmin || user.isManager ? 'Every project is open to you, including the work inside it.' : 'Every project is listed. You can open the ones you’re on. Each team on a project sets its own timeline.'}</p>
+          <p className="lede">{user.isAdmin || user.isManager || user.isLead ? 'Every project is open to you. Team leads and managers are already on each one.' : 'Every project is listed. You can open the ones you’re on. Each team on a project sets its own timeline.'}</p>
         </div>
         {canCreate ? <button type="button" className="btn primary" onClick={() => setCreating(true)}>New project</button> : null}
       </div>
@@ -98,7 +98,7 @@ export default function Projects() {
                 {project.departments.map((item) => <span key={item.id} className="chip">{item.name}</span>)}
               </div>
               <div className="progress" aria-hidden="true"><span style={{ width: `${pct}%` }} /></div>
-              <small className="muted">{project.doneCount} of {project.taskCount} done · {project.members.length} people · {project.createdByName}</small>
+              <small className="muted">{project.doneCount} of {project.taskCount} done · {project.members.filter((member) => !member.implicit).length} people · {project.createdByName}</small>
               {project.canOpen ? null : <small className="late">You’re not on this project</small>}
             </>
           );
@@ -135,18 +135,14 @@ export default function Projects() {
             </div>
             <div className="field">
               <span>Teams on this project</span>
-              <p className="hint">A team lead can include other teams, then pick people from those teams.</p>
+              <p className="hint">Each team lead sets that team’s timeline after the project is created.</p>
               <div className="checks">
                 {departmentChoices.map((item) => (
                   <label key={item.id} className="check">
                     <input
                       type="checkbox"
                       checked={form.departmentIds.includes(item.id)}
-                      onChange={() => setForm({
-                        ...form,
-                        departmentIds: toggle(form.departmentIds, item.id),
-                        memberIds: form.memberIds.filter((id) => people.find((person) => person.id === id)?.departments.some((dep) => toggle(form.departmentIds, item.id).includes(dep.id))),
-                      })}
+                      onChange={() => setForm({ ...form, departmentIds: toggle(form.departmentIds, item.id) })}
                     />
                     {item.name}
                   </label>
@@ -155,6 +151,7 @@ export default function Projects() {
             </div>
             <div className="field">
               <span>People</span>
+              <p className="hint">Team leads and managers are already on every project. Everyone else in the company is listed here.</p>
               <div className="checks">
                 {memberChoices.map((person) => (
                   <label key={person.id} className="check">
@@ -162,7 +159,6 @@ export default function Projects() {
                     {person.name}
                   </label>
                 ))}
-                {form.departmentIds.length === 0 ? <p className="hint">Choose a department first.</p> : null}
               </div>
             </div>
             {formError ? <p className="error">{formError}</p> : null}
