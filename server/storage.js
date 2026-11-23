@@ -5,8 +5,8 @@ import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectComm
 import { loadEnv } from './store.js';
 
 const uploadDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'uploads');
-const FOLDERS = new Set(['resumes', 'knowledge', 'reports']);
-const LEGACY = ['resumes', 'knowledge', 'reports', 'files'];
+const FOLDERS = new Set(['resumes', 'knowledge', 'knowledgebase', 'reports']);
+const LEGACY = ['resumes', 'knowledge', 'knowledgebase', 'reports', 'files'];
 
 let client;
 let clientRegion = '';
@@ -80,7 +80,7 @@ export function safeKey(raw) {
     return '';
   }
   if (!key || key.includes('..') || key.includes('\\') || key.includes('\0')) return '';
-  if (/^(resumes|knowledge|reports|files)\/file_[A-Za-z0-9-]+\.[A-Za-z0-9]+$/.test(key)) return key;
+  if (/^(resumes|knowledge|knowledgebase|reports|files)\/file_[A-Za-z0-9-]+\.[A-Za-z0-9]+$/.test(key)) return key;
   if (/^file_[A-Za-z0-9-]+\.[A-Za-z0-9]+$/.test(key)) return key;
   return '';
 }

@@ -254,6 +254,15 @@ export async function ensureIndexes() {
   await database.collection('knowledge_items').createIndex({ kind: 1, created_at: -1 });
   await database.collection('knowledge_items').createIndex({ user_id: 1 });
   await database.collection('knowledge_items').createIndex({ project_id: 1 });
+  await database.collection('kb_entries').createIndex({ created_at: -1 });
+  await database.collection('kb_entries').createIndex({ author_id: 1 });
+  await database.collection('kb_entries').createIndex(
+    { legacy_id: 1 },
+    { unique: true, partialFilterExpression: { legacy_id: { $type: 'string' } }, name: 'kb_entries_legacy' },
+  );
+  await database.collection('kb_chunks').createIndex({ entry_id: 1 });
+  await database.collection('kb_chats').createIndex({ user_id: 1, updated_at: -1 });
+  await database.collection('kb_messages').createIndex({ chat_id: 1, position: 1 });
   await database.collection('task_dependencies').createIndex({ task_id: 1, status: 1 });
   await database.collection('task_dependencies').createIndex({ depends_on_id: 1, status: 1 });
   await database.collection('hiring_positions').createIndex({ department_id: 1 });

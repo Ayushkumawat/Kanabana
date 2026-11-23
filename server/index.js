@@ -39,6 +39,7 @@ import {
 import { seedIfEmpty } from './seed.js';
 import { lanAddresses, publishOfficeName } from './office.js';
 import { loadEnv } from './store.js';
+import { registerAssistant } from './assistant.js';
 import { registerSections } from './sections.js';
 import { announcementPending } from './announcements.js';
 import { finishGoogleAuth, googleAuthUrl, googleReady } from './google.js';
@@ -66,7 +67,7 @@ app.use((_req, res, next) => {
   next();
 });
 app.use(cors({ origin: true }));
-app.use(express.json({ limit: '20mb' }));
+app.use(express.json({ limit: '40mb' }));
 app.use('/api', (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -1077,6 +1078,10 @@ async function eraseUser(person, requestedById) {
     await updateMany('hiring_resumes', { user_id: person.id }, { user_id: null });
     await updateMany('knowledge_items', { user_id: person.id }, { user_id: null });
     await updateMany('knowledge_items', { author_id: person.id }, { author_id: null });
+    const chats = await findMany('kb_chats', { user_id: person.id });
+    if (chats.length) await deleteMany('kb_messages', { chat_id: { $in: chats.map((chat) => chat.id) } });
+    await deleteMany('kb_chats', { user_id: person.id });
+    await updateMany('kb_entries', { author_id: person.id }, { author_id: null });
     await updateMany('reports', { author_id: person.id }, { author_id: requestedById });
     await deleteMany('personal_notes', { user_id: person.id });
     await deleteMany('notepad_days', { user_id: person.id });
@@ -2770,6 +2775,15 @@ registerSections(app, {
   maybeFinishDeparture,
   isISODate,
   uniqueList,
+  wrap,
+});
+
+registerAssistant(app, {
+  requireAuth,
+  requireAdmin,
+  bad,
+  readText,
+  maybeFinishDeparture,
   wrap,
 });
 

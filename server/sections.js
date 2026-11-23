@@ -22,6 +22,7 @@ import { audienceUsers, mustAck } from './announcements.js';
 import { sendDependencyEmail } from './mail.js';
 import { createGoogleMeet, deleteGoogleEvent, googleReady } from './google.js';
 import { isTime, sendInvites } from './meetings.js';
+import { rememberLegacyItem } from './assistant.js';
 import { deleteStored, existsStored, putStored, readStored, safeKey, storageConfigured } from './storage.js';
 
 const fileTickets = new Map();
@@ -272,7 +273,7 @@ export function registerSections(app, ctx) {
       if (userId !== req.auth.id && !req.auth.isAdmin) return bad(res, 403, 'You can upload your own KT document');
       const person = await findOne('users', { _id: userId });
       if (!person) return bad(res, 404, 'Person not found');
-      await insertOne('knowledge_items', {
+      const item = {
         id: id('kno'),
         kind: 'kt',
         title: title.value,
@@ -286,7 +287,9 @@ export function registerSections(app, ctx) {
         task_id: null,
         author_id: req.auth.id,
         created_at: now(),
-      });
+      };
+      await insertOne('knowledge_items', item);
+      await rememberLegacyItem(item);
       await logActivity(req.auth.id, `${req.auth.name} added a KT document for ${person.name}.`);
       const finished = await maybeFinishDeparture(person.id, req.auth);
       return res.status(201).json({ ok: true, removed: finished.removed, message: finished.removed ? finished.message : 'KT document saved' });
@@ -300,7 +303,7 @@ export function registerSections(app, ctx) {
       const task = await rawTask(taskId);
       if (!task || task.project_id !== project.id) return bad(res, 400, 'That task is not on this project');
     }
-    await insertOne('knowledge_items', {
+    const item = {
       id: id('kno'),
       kind: 'project',
       title: title.value,
@@ -314,7 +317,9 @@ export function registerSections(app, ctx) {
       task_id: taskId,
       author_id: req.auth.id,
       created_at: now(),
-    });
+    };
+    await insertOne('knowledge_items', item);
+    await rememberLegacyItem(item);
     const members = await findMany('project_members', { project_id: project.id });
     for (const member of members) {
       if (member.user_id !== req.auth.id) {
