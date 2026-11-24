@@ -226,14 +226,14 @@ function terms(text) {
 
 function usefulOverlap(weights, text) {
   const hay = terms(text);
-  let count = 0;
-  let strong = false;
+  let long = 0;
+  let medium = 0;
   for (const word of weights.keys()) {
     if (!hay.has(word)) continue;
-    count += 1;
-    if (word.length >= 2) strong = true;
+    if (word.length >= 5) long += 1;
+    else if (word.length >= 3) medium += 1;
   }
-  return count >= 1 && (strong || count >= 2);
+  return long >= 1 || medium >= 2;
 }
 
 function scoreTerms(weights, text) {
@@ -406,7 +406,8 @@ function systemPrompt(auth, projects) {
   return [
     `You are the Kanabana office assistant. You are talking to ${auth.name}. Their login already identifies them. Never ask who they are or what their name is.`,
     'Help with day-to-day office work: how to run a project or script, where credentials and config are kept, architecture, platform credits, and short writing such as a status update or a checklist.',
-    'Use the knowledge notes when they answer the question. Mention the teammate who supplied a fact when that helps someone follow up. If the notes do not contain it, say so. Never invent passwords, paths, amounts, or steps.',
+    'Use a knowledge note only when it answers the latest message. If it does not, ignore it and do not mention it. Earlier messages do not make an old note relevant. Mention the teammate who supplied a fact only when you actually use that fact. Never invent passwords, paths, amounts, or steps.',
+    'When the person is adding something new, keep it separate from unrelated notes already saved. Do not rewrite or restate an older note unless they asked about that note.',
     'When a question is about starting work, hosting, APIs, GPUs, ads, or a named platform, and a credit note matches, say what can be used and the steps to use it.',
     'Files and text in the chat are not saved for other people until this person agrees. When they share something reusable — a KT, how to run something, where credentials live, an architecture, a credit balance, or the steps to use a credit — set a proposal. For an ordinary question or a one-off task, proposal is null.',
     'When a KT, architecture, or credit is missing the project, the run steps, where secrets live, the amount, the expiry, or how to redeem it, ask those questions in followUps.',
@@ -417,7 +418,7 @@ function systemPrompt(auth, projects) {
 }
 
 function contextBlock(hits) {
-  if (!hits.length) return 'Knowledge notes: none matched this message.';
+  if (!hits.length) return 'Knowledge notes: none match this message. Answer the latest message. Continue an earlier subject only when this message clearly refers to it, such as "what can I use in this?". A new subject does not revive an old note.';
   let used = 0;
   const parts = [];
   for (const hit of hits) {
@@ -553,7 +554,7 @@ async function reloadFiles(attachments) {
 
 async function writeChunks(entry) {
   await deleteMany('kb_chunks', { entry_id: entry.id });
-  const parts = chunkText(`${entry.title}\n${entry.author_name}\n${entry.project_name}\n${entry.body}`);
+  const parts = chunkText(`${entry.title}\n${entry.project_name}\n${entry.body}`);
   let position = 0;
   for (const text of parts) {
     await insertOne('kb_chunks', { id: id('kbh'), entry_id: entry.id, position, text });
@@ -626,11 +627,39 @@ export async function rememberLegacyItem(row) {
   }
 }
 
+export async function repairKnowledge() {
+  const entries = await findMany('kb_entries', {});
+  for (const entry of entries) await writeChunks(entry);
+  const chats = await findMany('kb_chats', {});
+  for (const chat of chats) {
+    const rows = await findMany('kb_messages', { chat_id: chat.id }, { sort: { position: 1, created_at: 1 } });
+    let lastUser = '';
+    for (const message of rows) {
+      if (message.role === 'user') {
+        lastUser = message.content || '';
+        continue;
+      }
+      if (message.role !== 'assistant' || !message.sources?.length) continue;
+      const kept = message.sources.filter((source) => {
+        const entry = entries.find((item) => item.id === source.entryId) || entries.find((item) => item.title === source.title);
+        if (!entry) return false;
+        return rankChunks(lastUser, [entry], [{
+          entry_id: entry.id,
+          position: 0,
+          text: `${entry.title}\n${entry.project_name || ''}\n${entry.body || ''}`,
+        }]).length > 0;
+      });
+      if (kept.length !== message.sources.length) await updateOne('kb_messages', { _id: message.id }, { sources: kept });
+    }
+  }
+}
+
 function syncLegacyKnowledge() {
   if (!synced) {
     synced = (async () => {
       const items = await findMany('knowledge_items', {});
       for (const item of items) await rememberLegacyItem(item);
+      await repairKnowledge();
     })().catch((error) => {
       synced = null;
       console.error(`Knowledge sync failed: ${error.message}`);
@@ -1033,8 +1062,7 @@ export function registerAssistant(app, ctx) {
       .filter((item) => item.id !== userMessage.id && (item.role === 'user' || item.role === 'assistant'))
       .slice(-10)
       .map((item) => ({ role: item.role, content: String(item.content || '').slice(0, 3000) }));
-    const prior = historyRows.filter((item) => item.id !== userMessage.id && item.role === 'user').slice(-3).map((item) => item.content);
-    const query = [chat.title, ...prior, userText, ...storedFiles.map((file) => `${file.name}\n${file.text.slice(0, 500)}`)].filter(Boolean).join('\n');
+    const query = [userText, ...storedFiles.map((file) => `${file.name}\n${file.text.slice(0, 500)}`)].filter(Boolean).join('\n');
     const corpus = await (async () => {
       const [entries, chunks] = await Promise.all([
         findMany('kb_entries', {}),
